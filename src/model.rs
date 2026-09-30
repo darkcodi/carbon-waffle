@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::{fmt, fs, path::Path};
+use std::{collections::HashMap, fmt, fs, path::Path};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Interface {
@@ -81,6 +81,37 @@ pub struct Station {
 pub struct Survey {
     pub networks: Vec<Network>,
     pub stations: Vec<Station>,
+}
+
+pub struct NetworkGroup<'a> {
+    pub ssid: &'a str,
+    pub access_points: Vec<&'a Network>,
+}
+
+impl Survey {
+    pub fn network_groups(&self, filter: &str) -> Vec<NetworkGroup<'_>> {
+        let filter = filter.to_lowercase();
+        let mut groups: Vec<NetworkGroup<'_>> = Vec::new();
+        let mut indices = HashMap::new();
+        // Preserve survey signal order, grouping exact SSIDs without combining
+        // the BSSIDs, channels, or security settings used for target selection.
+        for network in &self.networks {
+            if !network.ssid.to_lowercase().contains(&filter)
+                && !network.bssid.to_lowercase().contains(&filter)
+            {
+                continue;
+            }
+            let index = *indices.entry(network.ssid.as_str()).or_insert_with(|| {
+                groups.push(NetworkGroup {
+                    ssid: &network.ssid,
+                    access_points: Vec::new(),
+                });
+                groups.len() - 1
+            });
+            groups[index].access_points.push(network);
+        }
+        groups
+    }
 }
 
 /// Airodump's CSV does not quote commas in ESSIDs. Its byte-length field is
@@ -280,6 +311,48 @@ Station MAC, First time seen, Last time seen, Power, # packets, BSSID, Probed ES
         assert_eq!(survey.networks[0].ssid, "Lab, One");
         assert_eq!(survey.networks[1].label(), "<hidden network>");
         assert_eq!(survey.stations.len(), 1);
+    }
+
+    #[test]
+    fn ssid_groups_preserve_bssids_security_and_filter_matches() {
+        let mut survey = demo_survey();
+        let ssid = survey.networks[0].ssid.clone();
+        survey.networks[1].ssid = ssid.clone();
+        survey.networks[1].bssid = "02:AA:00:00:01:02".into();
+        survey.networks[1].authentication = "SAE".into();
+        let mut different_case = survey.networks[0].clone();
+        different_case.ssid = ssid.to_lowercase();
+        different_case.bssid = "02:00:00:00:01:04".into();
+        survey.networks.push(different_case);
+        let mut another_hidden = survey.networks[2].clone();
+        another_hidden.bssid = "02:00:00:00:01:05".into();
+        survey.networks.push(another_hidden);
+
+        let groups = survey.network_groups("");
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].ssid, ssid);
+        assert_eq!(
+            groups[0].access_points,
+            vec![&survey.networks[0], &survey.networks[1]]
+        );
+        assert_ne!(
+            groups[0].access_points[0].channel,
+            groups[0].access_points[1].channel
+        );
+        assert_ne!(
+            groups[0].access_points[0].authentication,
+            groups[0].access_points[1].authentication
+        );
+        assert!(groups[1].ssid.is_empty());
+        assert_eq!(groups[1].access_points.len(), 2);
+        assert_eq!(groups[2].ssid, ssid.to_lowercase());
+
+        let by_name = survey.network_groups(&ssid.to_uppercase());
+        assert_eq!(by_name.len(), 2); // Search ignores case, grouping preserves it.
+        let by_bssid = survey.network_groups("02:aa:00:00:01:02");
+        assert_eq!(by_bssid.len(), 1);
+        assert_eq!(by_bssid[0].access_points, vec![&survey.networks[1]]);
+        assert!(survey.network_groups("no such network").is_empty());
     }
 
     #[test]

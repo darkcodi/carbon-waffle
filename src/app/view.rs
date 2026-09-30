@@ -1,6 +1,6 @@
 use super::{
-    Action, App, Authorization, CommandActivity, Engine, Message, Operation, Page, Panel, Tool,
-    appearance as style,
+    Action, App, Authorization, CommandActivity, Engine, Message, Network, Operation, Page, Panel,
+    Tool, appearance as style,
 };
 use iced::{
     Border, Center, Element, Fill, Font, Length, Theme,
@@ -472,7 +472,6 @@ impl App {
             || self.jobs.iter().all(|job| {
                 !job.operation.radio() || matches!(job.operation, Operation::Scan { .. })
             });
-        let filter = self.filter.to_lowercase();
         let mut content = column![heading(
             "Choose a network.",
             "Discover nearby access points and select one for this session."
@@ -522,7 +521,11 @@ impl App {
         );
 
         let mut networks = column![].spacing(8).width(Fill);
-        let mut hidden_networks = column![].spacing(8).width(Fill);
+        let groups = self.survey.network_groups(&self.filter);
+        let hidden = groups.iter().find(|group| group.ssid.is_empty());
+        let hidden_count = hidden.map_or(0, |group| group.access_points.len());
+        let ssid_count = groups.iter().filter(|group| !group.ssid.is_empty()).count();
+        let count: usize = groups.iter().map(|group| group.access_points.len()).sum();
         // Count clients once per survey view, instead of scanning every station
         // again for every access point on each UI update.
         let mut client_counts = HashMap::new();
@@ -531,76 +534,8 @@ impl App {
                 .entry(station.bssid.as_str())
                 .or_insert(0usize) += 1;
         }
-        let mut count = 0;
-        let mut hidden_count = 0;
-        for network in self.survey.networks.iter().filter(|network| {
-            network.ssid.to_lowercase().contains(&filter)
-                || network.bssid.to_lowercase().contains(&filter)
-        }) {
-            count += 1;
-            let hidden = network.ssid.is_empty();
-            if hidden {
-                hidden_count += 1;
-                if !self.panels.hidden_networks {
-                    continue;
-                }
-            }
-            let selected = self
-                .target
-                .as_ref()
-                .is_some_and(|target| target.bssid == network.bssid);
-            let clients = client_counts
-                .get(network.bssid.as_str())
-                .copied()
-                .unwrap_or(0);
-            let entry = button(
-                row![
-                    text(if selected { "●" } else { "○" })
-                        .size(21)
-                        .color(if selected {
-                            style::ACCENT
-                        } else {
-                            style::MUTED
-                        }),
-                    column![
-                        text(network.label()).font(style::SEMIBOLD).size(16),
-                        text(&network.bssid)
-                            .font(Font::MONOSPACE)
-                            .size(11)
-                            .color(style::MUTED),
-                    ]
-                    .spacing(6)
-                    .width(Fill),
-                    column![
-                        text(format!("{} · {}", network.security, network.authentication)).size(12),
-                        text(format!(
-                            "CH {}   {}   {} clients",
-                            network.channel,
-                            if network.power == -1 {
-                                "Unknown signal".into()
-                            } else {
-                                format!("{} dBm", network.power)
-                            },
-                            clients
-                        ))
-                        .size(11)
-                        .color(style::MUTED),
-                    ]
-                    .spacing(6)
-                    .align_x(iced::Right),
-                ]
-                .spacing(16)
-                .align_y(Center),
-            )
-            .on_press_maybe(selectable.then(|| Message::Select(network.bssid.clone())))
-            .padding(12)
-            .width(Fill)
-            .style(move |_, status| style::choice(selected, status));
-            if hidden {
-                hidden_networks = hidden_networks.push(entry);
-            } else {
-                networks = networks.push(entry);
-            }
+        for group in groups.iter().filter(|group| !group.ssid.is_empty()) {
+            networks = networks.push(self.network_group(group, &client_counts, selectable));
         }
         if count == 0 {
             networks = networks.push(
@@ -615,7 +550,7 @@ impl App {
                         .font(style::SEMIBOLD),
                         text(if scan.is_some() {
                             "Listening for access points. Results will appear here."
-                        } else if !filter.is_empty() {
+                        } else if !self.filter.is_empty() {
                             "Try a different name or BSSID."
                         } else {
                             "Start a scan to see what's nearby."
@@ -634,7 +569,7 @@ impl App {
         content = content
             .push(
                 text(format!(
-                    "{count} networks{}{}",
+                    "{ssid_count} SSIDs  ·  {count} BSSIDs{}{}",
                     if hidden_count > 0 {
                         format!("  ·  {hidden_count} hidden")
                     } else {
@@ -646,17 +581,159 @@ impl App {
                 .color(style::MUTED),
             )
             .push(networks);
-        if hidden_count > 0 {
+        if let Some(hidden) = hidden {
             content = content.push(disclosure(
                 "Hidden networks",
                 self.panels.hidden_networks,
                 Panel::HiddenNetworks,
             ));
             if self.panels.hidden_networks {
+                let hidden_networks = hidden.access_points.iter().fold(
+                    column![].spacing(8).width(Fill),
+                    |list, network| {
+                        list.push(
+                            self.network_entry(
+                                network,
+                                client_counts
+                                    .get(network.bssid.as_str())
+                                    .copied()
+                                    .unwrap_or(0),
+                                selectable,
+                            ),
+                        )
+                    },
+                );
                 content = content.push(hidden_networks);
             }
         }
         container(content).max_width(780).width(Fill).into()
+    }
+
+    fn network_group<'a>(
+        &'a self,
+        group: &crate::model::NetworkGroup<'a>,
+        client_counts: &HashMap<&str, usize>,
+        selectable: bool,
+    ) -> Element<'a, Message> {
+        let open = self.expanded_networks.contains(group.ssid);
+        let selected = self.target.as_ref().filter(|target| {
+            group
+                .access_points
+                .iter()
+                .any(|network| network.bssid == target.bssid)
+        });
+        let bssids = format!(
+            "{} BSSID{}",
+            group.access_points.len(),
+            if group.access_points.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
+        let summary = if let Some(target) = selected {
+            format!(
+                "{bssids}  ·  selected {}  ·  CH {}",
+                target.bssid, target.channel
+            )
+        } else {
+            bssids
+        };
+        let header = button(
+            row![
+                column![
+                    text(group.ssid).font(style::SEMIBOLD).size(16),
+                    text(summary).size(11).color(style::MUTED),
+                ]
+                .spacing(6)
+                .width(Fill),
+                text(if open { "−" } else { "+" })
+                    .size(20)
+                    .width(20)
+                    .align_x(Center),
+            ]
+            .spacing(16)
+            .align_y(Center),
+        )
+        .on_press(Message::ToggleNetworkGroup(group.ssid.to_owned()))
+        .padding(12)
+        .width(Fill)
+        .style(move |_, status| style::choice(selected.is_some(), status));
+        let mut content = column![header].spacing(8).width(Fill);
+        if open {
+            let entries = group.access_points.iter().fold(
+                column![].spacing(8).width(Fill),
+                |list, network| {
+                    list.push(
+                        self.network_entry(
+                            network,
+                            client_counts
+                                .get(network.bssid.as_str())
+                                .copied()
+                                .unwrap_or(0),
+                            selectable,
+                        ),
+                    )
+                },
+            );
+            content = content.push(container(entries).padding(iced::Padding {
+                left: 20.0,
+                ..Default::default()
+            }));
+        }
+        content.into()
+    }
+
+    fn network_entry<'a>(
+        &'a self,
+        network: &'a Network,
+        clients: usize,
+        selectable: bool,
+    ) -> Element<'a, Message> {
+        let selected = self
+            .target
+            .as_ref()
+            .is_some_and(|target| target.bssid == network.bssid);
+        let identity = text(&network.bssid)
+            .font(Font::MONOSPACE)
+            .size(14)
+            .width(Fill);
+        button(
+            row![
+                text(if selected { "●" } else { "○" })
+                    .size(21)
+                    .color(if selected {
+                        style::ACCENT
+                    } else {
+                        style::MUTED
+                    }),
+                identity,
+                column![
+                    text(format!("{} · {}", network.security, network.authentication)).size(12),
+                    text(format!(
+                        "CH {}   {}   {} clients",
+                        network.channel,
+                        if network.power == -1 {
+                            "Unknown signal".into()
+                        } else {
+                            format!("{} dBm", network.power)
+                        },
+                        clients,
+                    ))
+                    .size(11)
+                    .color(style::MUTED),
+                ]
+                .spacing(6)
+                .align_x(iced::Right),
+            ]
+            .spacing(16)
+            .align_y(Center),
+        )
+        .on_press_maybe(selectable.then(|| Message::Select(network.bssid.clone())))
+        .padding(12)
+        .width(Fill)
+        .style(move |_, status| style::choice(selected, status))
+        .into()
     }
 
     fn capture(&self) -> Element<'_, Message> {

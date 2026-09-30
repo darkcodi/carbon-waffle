@@ -39,8 +39,18 @@ fn populated_app() -> App {
 fn scroll_rendering() {
     let mut app = populated_app();
     app.panels.dependencies = true;
-    for page in [Page::Elevate, Page::Discover] {
+    for (page, grouped) in [
+        (Page::Elevate, false),
+        (Page::Discover, false),
+        (Page::Discover, true),
+    ] {
         app.page = page;
+        if grouped {
+            for (index, network) in app.survey.networks.iter_mut().enumerate() {
+                network.ssid = format!("Research network {}", index / 4);
+                app.expanded_networks.insert(network.ssid.clone());
+            }
+        }
         let size = Size::new(900.0, 680.0);
         let viewport = Viewport::with_physical_size(Size::new(900, 680), 1.0);
         let mut renderer = iced_tiny_skia::Renderer::new(Font::DEFAULT, 16.0.into());
@@ -94,8 +104,15 @@ fn scroll_rendering() {
         layout_times.sort_by(f64::total_cmp);
         frame_times.sort_by(f64::total_cmp);
         eprintln!(
-            "{page:?}: layout median {:.2} ms; scroll + full software redraw median {:.2} ms, p95 {:.2} ms",
-            layout_times[10], frame_times[10], frame_times[18],
+            "{page:?}{}: layout median {:.2} ms; scroll + full software redraw median {:.2} ms, p95 {:.2} ms",
+            if grouped {
+                " (expanded SSID groups)"
+            } else {
+                ""
+            },
+            layout_times[10],
+            frame_times[10],
+            frame_times[18],
         );
     }
 }

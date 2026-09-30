@@ -6,7 +6,7 @@ use crate::{
 };
 use iced::{Subscription, Task};
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     fs,
     os::unix::fs::DirBuilderExt,
     path::PathBuf,
@@ -103,6 +103,7 @@ pub enum Message {
     Interface(Interface),
     Refresh,
     Select(String),
+    ToggleNetworkGroup(String),
     Filter(String),
     Station(String),
     Count(String),
@@ -153,6 +154,7 @@ pub struct App {
     survey: Survey,
     target: Option<Network>,
     filter: String,
+    expanded_networks: HashSet<String>,
     station: String,
     count: String,
     capture_path: String,
@@ -205,6 +207,7 @@ impl App {
             survey: Survey::default(),
             target: None,
             filter: String::new(),
+            expanded_networks: HashSet::new(),
             station: String::new(),
             count: "5".into(),
             capture_path: String::new(),
@@ -892,6 +895,11 @@ impl App {
                     self.station.clear();
                 }
             }
+            Message::ToggleNetworkGroup(ssid) => {
+                if !self.expanded_networks.remove(&ssid) {
+                    self.expanded_networks.insert(ssid);
+                }
+            }
             Message::Filter(value) => self.filter = value,
             Message::Station(value) => self.station = value,
             Message::Count(value) => self.count = value,
@@ -983,6 +991,33 @@ mod tests {
             let _ = app.update(Message::Tick);
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn expanding_ssid_groups_keeps_selection_on_an_explicit_bssid() {
+        let mut app = demo_app();
+        app.page = Page::Discover;
+        app.target = None;
+        let ssid = app.survey.networks[0].ssid.clone();
+        app.survey.networks[1].ssid = ssid.clone();
+        let target = app.survey.networks[1].clone();
+        assert!(app.expanded_networks.is_empty());
+        let _ = app.update(Message::ToggleNetworkGroup(ssid.clone()));
+        assert!(app.target.is_none());
+        assert!(!app.can_advance());
+        let _ = app.update(Message::Select(target.bssid.clone()));
+        assert!(app.can_advance());
+        let _ = app.update(Message::ToggleNetworkGroup(ssid.clone()));
+        assert!(!app.expanded_networks.contains(&ssid));
+        assert_eq!(app.target.as_ref(), Some(&target));
+        let _ = app.update(Message::ToggleNetworkGroup(ssid.clone()));
+        app.survey.networks.reverse();
+        let _ = app.update(Message::Filter(target.bssid.clone()));
+        assert!(app.expanded_networks.contains(&ssid));
+        assert!(matches!(
+            app.operation(Action::Capture).unwrap(),
+            Operation::Capture { bssid, channel, .. } if bssid == target.bssid && channel == target.channel
+        ));
     }
 
     #[test]
