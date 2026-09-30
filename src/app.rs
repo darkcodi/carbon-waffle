@@ -62,6 +62,7 @@ impl Page {
 pub enum Panel {
     Activity,
     Dependencies,
+    HiddenNetworks,
     Reconnect,
     CaptureFile,
     Conversion,
@@ -72,6 +73,7 @@ pub enum Panel {
 struct Panels {
     activity: bool,
     dependencies: bool,
+    hidden_networks: bool,
     reconnect: bool,
     capture_file: bool,
     conversion: bool,
@@ -936,6 +938,7 @@ impl App {
                 let open = match panel {
                     Panel::Activity => &mut self.panels.activity,
                     Panel::Dependencies => &mut self.panels.dependencies,
+                    Panel::HiddenNetworks => &mut self.panels.hidden_networks,
                     Panel::Reconnect => &mut self.panels.reconnect,
                     Panel::CaptureFile => &mut self.panels.capture_file,
                     Panel::Conversion => &mut self.panels.conversion,

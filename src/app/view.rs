@@ -522,6 +522,7 @@ impl App {
         );
 
         let mut networks = column![].spacing(8).width(Fill);
+        let mut hidden_networks = column![].spacing(8).width(Fill);
         // Count clients once per survey view, instead of scanning every station
         // again for every access point on each UI update.
         let mut client_counts = HashMap::new();
@@ -531,11 +532,19 @@ impl App {
                 .or_insert(0usize) += 1;
         }
         let mut count = 0;
+        let mut hidden_count = 0;
         for network in self.survey.networks.iter().filter(|network| {
             network.ssid.to_lowercase().contains(&filter)
                 || network.bssid.to_lowercase().contains(&filter)
         }) {
             count += 1;
+            let hidden = network.ssid.is_empty();
+            if hidden {
+                hidden_count += 1;
+                if !self.panels.hidden_networks {
+                    continue;
+                }
+            }
             let selected = self
                 .target
                 .as_ref()
@@ -544,52 +553,54 @@ impl App {
                 .get(network.bssid.as_str())
                 .copied()
                 .unwrap_or(0);
-            networks = networks.push(
-                button(
-                    row![
-                        text(if selected { "●" } else { "○" })
-                            .size(21)
-                            .color(if selected {
-                                style::ACCENT
-                            } else {
-                                style::MUTED
-                            }),
-                        column![
-                            text(network.label()).font(style::SEMIBOLD).size(16),
-                            text(&network.bssid)
-                                .font(Font::MONOSPACE)
-                                .size(11)
-                                .color(style::MUTED),
-                        ]
-                        .spacing(6)
-                        .width(Fill),
-                        column![
-                            text(format!("{} · {}", network.security, network.authentication))
-                                .size(12),
-                            text(format!(
-                                "CH {}   {}   {} clients",
-                                network.channel,
-                                if network.power == -1 {
-                                    "Unknown signal".into()
-                                } else {
-                                    format!("{} dBm", network.power)
-                                },
-                                clients
-                            ))
+            let entry = button(
+                row![
+                    text(if selected { "●" } else { "○" })
+                        .size(21)
+                        .color(if selected {
+                            style::ACCENT
+                        } else {
+                            style::MUTED
+                        }),
+                    column![
+                        text(network.label()).font(style::SEMIBOLD).size(16),
+                        text(&network.bssid)
+                            .font(Font::MONOSPACE)
                             .size(11)
                             .color(style::MUTED),
-                        ]
-                        .spacing(6)
-                        .align_x(iced::Right),
                     ]
-                    .spacing(16)
-                    .align_y(Center),
-                )
-                .on_press_maybe(selectable.then(|| Message::Select(network.bssid.clone())))
-                .padding(12)
-                .width(Fill)
-                .style(move |_, status| style::choice(selected, status)),
-            );
+                    .spacing(6)
+                    .width(Fill),
+                    column![
+                        text(format!("{} · {}", network.security, network.authentication)).size(12),
+                        text(format!(
+                            "CH {}   {}   {} clients",
+                            network.channel,
+                            if network.power == -1 {
+                                "Unknown signal".into()
+                            } else {
+                                format!("{} dBm", network.power)
+                            },
+                            clients
+                        ))
+                        .size(11)
+                        .color(style::MUTED),
+                    ]
+                    .spacing(6)
+                    .align_x(iced::Right),
+                ]
+                .spacing(16)
+                .align_y(Center),
+            )
+            .on_press_maybe(selectable.then(|| Message::Select(network.bssid.clone())))
+            .padding(12)
+            .width(Fill)
+            .style(move |_, status| style::choice(selected, status));
+            if hidden {
+                hidden_networks = hidden_networks.push(entry);
+            } else {
+                networks = networks.push(entry);
+            }
         }
         if count == 0 {
             networks = networks.push(
@@ -623,13 +634,28 @@ impl App {
         content = content
             .push(
                 text(format!(
-                    "{count} networks{}",
+                    "{count} networks{}{}",
+                    if hidden_count > 0 {
+                        format!("  ·  {hidden_count} hidden")
+                    } else {
+                        String::new()
+                    },
                     if scan.is_some() { "  ·  scanning" } else { "" }
                 ))
                 .size(12)
                 .color(style::MUTED),
             )
             .push(networks);
+        if hidden_count > 0 {
+            content = content.push(disclosure(
+                "Hidden networks",
+                self.panels.hidden_networks,
+                Panel::HiddenNetworks,
+            ));
+            if self.panels.hidden_networks {
+                content = content.push(hidden_networks);
+            }
+        }
         container(content).max_width(780).width(Fill).into()
     }
 
