@@ -20,6 +20,8 @@ Demo mode uses synthetic networks and simulated jobs. It never executes the wire
 
 The **Adapter & tool details** section in Monitoring reports detected executables. On NixOS, `nix-shell` provides build and GUI runtime libraries, plus the external tools. Desktop polkit configuration still comes from your system.
 
+The UI renders on the CPU with tiny-skia; it does not require Vulkan, OpenGL, or GPU drivers for rendering. Development builds optimize rasterization and text shaping so ordinary `cargo run` avoids the large scrolling stalls of an unoptimized renderer. The first build takes longer; subsequent app-only rebuilds reuse the optimized dependencies. This keeps the rendering stack suitable for portable packaging such as AppImage.
+
 ## Workflow
 
 The four steps at the top are **Monitoring → Discover → Capture → Recover**. Select any step to revisit it; changing steps does not run a command. Each screen contains the controls for that step, with additional options tucked into expandable sections.
@@ -60,6 +62,8 @@ cargo fmt --all -- --check
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
+
+To measure scrolling without opening a window or touching the radio, run `cargo test scroll_rendering -- --ignored --nocapture`. This opt-in benchmark scrolls the actual Monitoring and Discover screens, including 250 synthetic networks and 500 clients, into an in-memory software framebuffer. It reports warmed layout and full-redraw timings, excluding compositor presentation. The app polls job output while jobs run and sleeps between input events when idle.
 
 Tests use synthetic scan data, simulated adapters, and fake local subprocesses. They cover cancellation, adapter handoff, partial setup failure, restoration retries, and misleading tool exit codes. They do not scan, transmit packets, change interfaces, or attempt password recovery against real captures. Hardware behavior needs validation on a research adapter and test AP.
 

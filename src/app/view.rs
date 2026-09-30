@@ -6,6 +6,7 @@ use iced::{
     Border, Center, Element, Fill, Font, Length, Theme,
     widget::{self, button, column, container, pick_list, row, scrollable, text, text_input},
 };
+use std::collections::HashMap;
 
 impl App {
     pub fn theme(&self) -> Theme {
@@ -391,6 +392,14 @@ impl App {
         );
 
         let mut networks = column![].spacing(8).width(Fill);
+        // Count clients once per survey view, instead of scanning every station
+        // again for every access point on each UI update.
+        let mut client_counts = HashMap::new();
+        for station in &self.survey.stations {
+            *client_counts
+                .entry(station.bssid.as_str())
+                .or_insert(0usize) += 1;
+        }
         let mut count = 0;
         for network in self.survey.networks.iter().filter(|network| {
             network.ssid.to_lowercase().contains(&filter)
@@ -401,12 +410,10 @@ impl App {
                 .target
                 .as_ref()
                 .is_some_and(|target| target.bssid == network.bssid);
-            let clients = self
-                .survey
-                .stations
-                .iter()
-                .filter(|station| station.bssid == network.bssid)
-                .count();
+            let clients = client_counts
+                .get(network.bssid.as_str())
+                .copied()
+                .unwrap_or(0);
             networks = networks.push(
                 button(
                     row![

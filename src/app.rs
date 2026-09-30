@@ -16,6 +16,9 @@ use std::{
 mod appearance;
 mod view;
 
+#[cfg(test)]
+mod performance;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Monitoring,
@@ -204,10 +207,14 @@ impl App {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        Subscription::batch([
-            iced::time::every(Duration::from_millis(100)).map(|_| Message::Tick),
-            iced::window::close_requests().map(|_| Message::Close),
-        ])
+        // Poll only while work can produce events (or shutdown needs advancing).
+        // Empty ticks otherwise rebuild and lay out every visible widget at 10 Hz.
+        let jobs = if !self.jobs.is_empty() || self.pending.is_some() || self.closing {
+            iced::time::every(Duration::from_millis(100)).map(|_| Message::Tick)
+        } else {
+            Subscription::none()
+        };
+        Subscription::batch([jobs, iced::window::close_requests().map(|_| Message::Close)])
     }
 
     fn refresh(&mut self) {
@@ -892,5 +899,18 @@ mod tests {
         assert!(app.demo);
         let _ = app.update(Message::StopAll);
         pump_until(&mut app, |a| a.jobs.is_empty());
+    }
+
+    #[test]
+    fn idle_polling_sleeps_but_jobs_and_window_closure_still_advance() {
+        let mut app = demo_app();
+        assert_eq!(app.subscription().units(), 1); // Window close listener only.
+        app.run(Action::Scan);
+        assert_eq!(app.subscription().units(), 2);
+        let _ = app.update(Message::StopAll);
+        pump_until(&mut app, |a| a.jobs.is_empty());
+        assert_eq!(app.subscription().units(), 1);
+        let _ = app.update(Message::Close);
+        assert_eq!(app.subscription().units(), 2);
     }
 }
