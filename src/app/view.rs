@@ -1,5 +1,5 @@
 use super::{
-    Action, App, CommandActivity, Engine, Message, Operation, Page, Panel, Tool,
+    Action, App, Authorization, CommandActivity, Engine, Message, Operation, Page, Panel, Tool,
     appearance as style,
 };
 use iced::{
@@ -815,7 +815,7 @@ impl App {
                     } else if job.started {
                         "Running"
                     } else {
-                        "Starting · authorization may be required"
+                        "Starting…"
                     })
                     .size(12)
                     .color(style::MUTED),
@@ -852,7 +852,11 @@ impl App {
         .width(190)
         .padding([14, 20])
         .on_press_maybe(
-            (enabled && !self.closing && self.pending.is_none()).then_some(Message::Run(action)),
+            (enabled
+                && self.authorization == Authorization::Ready
+                && !self.closing
+                && self.pending.is_none())
+            .then_some(Message::Run(action)),
         )
         .style(style::primary)
     }

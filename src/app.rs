@@ -2,7 +2,7 @@ use crate::{
     command::{Engine, Operation, Tool, find_tool},
     model::{self, Interface, Network, Survey, absolute_path},
     monitor::NetworkRestore,
-    runner::{Event, Job, Runner},
+    runner::{Authorization, Event, Job, Runner},
 };
 use iced::{Subscription, Task};
 use std::{
@@ -80,6 +80,7 @@ pub enum Action {
 #[derive(Debug, Clone)]
 pub enum Message {
     Tick,
+    Authorization(Authorization),
     Page(Page),
     Interface(Interface),
     Refresh,
@@ -142,6 +143,7 @@ pub struct App {
     engine: Engine,
     tools: Vec<(Tool, bool)>,
     runner: Runner,
+    authorization: Authorization,
     jobs: Vec<Job>,
     pending: Option<Operation>,
     next_id: u64,
@@ -155,8 +157,16 @@ pub struct App {
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn boot() -> (Self, Task<Message>) {
         let demo = std::env::args().any(|arg| arg == "--demo");
+        let mut app = Self::new(demo);
+        // Lifecycle notifications wake the UI directly; no idle polling is
+        // needed to detect authorization or an unexpectedly disconnected helper.
+        let updates = app.runner.authorization.take().unwrap();
+        (app, Task::run(updates, Message::Authorization))
+    }
+
+    fn new(demo: bool) -> Self {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -185,14 +195,19 @@ impl App {
                 .into_iter()
                 .map(|tool| (tool, find_tool(tool.name()).is_some()))
                 .collect(),
-            runner: Runner::new(),
+            runner: Runner::new(demo),
+            authorization: if demo {
+                Authorization::Ready
+            } else {
+                Authorization::Pending
+            },
             jobs: vec![],
             pending: None,
             next_id: 0,
             session,
             activity: vec![],
             copied_activity: None,
-            status: "Ready when you are.".into(),
+            status: "Authorize this session in the desktop prompt…".into(),
             status_error: false,
             panels: Panels::default(),
             closing: false,
@@ -324,8 +339,6 @@ impl App {
                     operation.label(),
                     if self.demo {
                         " · simulated"
-                    } else if spec.privileged {
-                        " · waiting for worker / desktop authorization"
                     } else {
                         " · starting"
                     }
@@ -487,6 +500,9 @@ impl App {
     }
 
     fn run(&mut self, action: Action) {
+        if self.authorization != Authorization::Ready {
+            return;
+        }
         if self.closing || self.pending.is_some() {
             return;
         }
@@ -659,6 +675,17 @@ impl App {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::Authorization(authorization) => {
+                match &authorization {
+                    Authorization::Ready if !self.closing => {
+                        self.status = "Ready when you are.".into();
+                        self.status_error = false;
+                    }
+                    Authorization::Failed(error) if !self.closing => self.fail(error.clone()),
+                    _ => {}
+                }
+                self.authorization = authorization;
+            }
             Message::Tick => {
                 let events: Vec<_> = self.runner.events.try_iter().take(512).collect();
                 for (id, event) in events {
@@ -700,7 +727,7 @@ impl App {
                             Ok(operation) => self.launch(operation),
                             Err(error) => self.fail(error),
                         }
-                    } else {
+                    } else if self.runner.shutdown() {
                         return iced::exit();
                     }
                 }
@@ -802,8 +829,7 @@ mod tests {
     use std::{thread, time::Instant};
 
     fn demo_app() -> App {
-        let mut app = App::new();
-        app.demo = true;
+        let mut app = App::new(true);
         app.interfaces = vec![Interface {
             name: "wlan0mon".into(),
             phy: "phy0".into(),
@@ -868,5 +894,25 @@ mod tests {
         assert_eq!(app.subscription().units(), 1);
         let _ = app.update(Message::Close);
         assert_eq!(app.subscription().units(), 2);
+    }
+
+    #[test]
+    fn tools_wait_for_startup_authorization_and_stop_accepting_jobs_on_failure() {
+        let mut app = demo_app();
+        app.authorization = Authorization::Pending;
+        app.run(Action::Scan);
+        assert!(app.jobs.is_empty());
+        let _ = app.update(Message::Authorization(Authorization::Ready));
+        app.run(Action::Scan);
+        assert_eq!(app.jobs.len(), 1);
+        let _ = app.update(Message::StopAll);
+        pump_until(&mut app, |app| app.jobs.is_empty());
+        let _ = app.update(Message::Authorization(Authorization::Failed(
+            "Session ended".into(),
+        )));
+        assert!(app.status_error);
+        app.run(Action::Scan);
+        assert!(app.jobs.is_empty());
+        assert_eq!(app.subscription().units(), 1);
     }
 }

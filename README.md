@@ -9,13 +9,15 @@ cargo run
 
 Demo mode is selected with `--demo` at launch and uses synthetic networks and simulated jobs. It never executes the wireless tools or writes captures.
 
+Live mode requests desktop authorization once at startup. The same elevated helper runs every radio operation for that app session, including adapter restoration, so subsequent button clicks do not prompt again. Closing the app ends the helper. Demo mode does not request authorization. If authorization is cancelled or the helper exits unexpectedly, the app reports the error; restart to authorize a fresh session.
+
 ## Requirements
 
 - Linux, a Rust toolchain supporting edition 2024 and iced 0.14, and a Wayland or X11 desktop.
 - `airmon-ng`, `airodump-ng`, `aireplay-ng`, and `aircrack-ng` on `PATH`.
 - `nmcli` on `PATH` for automatic adapter handoff on systems using NetworkManager.
 - Optional: `hcxpcapngtool` (hcxtools) for conversion and `hashcat` plus its GPU compute runtime for GPU recovery.
-- `pkexec` (polkit) and a running desktop polkit authentication agent for privileged radio operations.
+- `pkexec` (polkit) and a running desktop polkit authentication agent for startup authorization.
 - An adapter/driver supporting monitor mode; injection support for deauthentication.
 
 The **Prerequisites** section in Monitoring reports detected executables. On NixOS, `nix-shell` provides build and GUI runtime libraries, plus the external tools. Desktop polkit configuration still comes from your system.
@@ -47,11 +49,14 @@ The adapter handoff does not run `airmon-ng check kill` or restart system networ
 - `src/model.rs`: sysfs adapter discovery, airodump CSV parsing, and input validation.
 - `src/command.rs`: typed operations and argument builders. Commands use `Command::args`, never a shell; absolute paths keep file names from becoming options.
 - `src/runner.rs`: worker IPC, concurrent output readers, snapshot delivery, and process-group cancellation.
+- `src/runner/session.rs`: startup authorization, session helper lifecycle, and concurrent privileged job dispatch.
 - `src/monitor.rs`: adapter-specific NetworkManager handoff, mode verification, and rollback.
 
-The desktop UI runs as your user. Radio operations start this executable's `--worker` mode through `pkexec`; offline operations start an unprivileged worker. The authenticated helper receives a single typed request over stdin and executes each tool with a fresh process group. Closing the pipe requests cancellation inside the worker, so it can stop root-owned descendants. It sends SIGINT first to let capture files flush, then SIGKILL after a grace period. Monitoring setup and cleanup commands have a 30-second timeout; requested cancellation does not interrupt rollback. A GUI crash closes its pipes and stops tool processes, but cannot guarantee adapter restoration after setup has finished. If needed, use `sudo airmon-ng stop <monitor-interface>` and then `sudo nmcli device set <restored-interface> managed yes` for an adapter previously managed by NetworkManager.
+The desktop UI runs as your user, retaining normal X11/Wayland access. At startup, `pkexec` launches this executable's `--session-worker` mode once. It receives typed start/cancel requests over private stdin/stdout pipes and runs each radio tool in its own process group; concurrent jobs retain separate output and cancellation. Offline operations use an unprivileged `--worker`, without another authorization prompt. No passwords are collected or stored by the application, and no system daemon or custom authorization policy is installed.
 
-This is a local development helper, not an installed privileged service. Keep polkit's interactive authorization: do not make the executable setuid or create a passwordless policy for a user-writable build. The helper executes the tool paths discovered in your environment, including Nix wrappers.
+Normal closure stops jobs, restores the session's adapter, and waits for the elevated helper to exit. Closing its control pipe also cancels active jobs inside the helper, including root-owned descendants. It sends SIGINT first to let capture files flush, then SIGKILL after a grace period. Monitoring setup and cleanup commands have a 30-second timeout; requested cancellation does not interrupt rollback. A GUI crash closes its pipes and stops tool processes, but cannot guarantee adapter restoration after setup has finished. If needed, use `sudo airmon-ng stop <monitor-interface>` and then `sudo nmcli device set <restored-interface> managed yes` for an adapter previously managed by NetworkManager.
+
+This is a local development helper, not an installed privileged service. Keep polkit's interactive startup authorization: do not make the executable setuid or create a passwordless policy for a user-writable build. The helper executes the tool paths discovered in your environment, including Nix wrappers.
 
 ## Scope and validation
 
@@ -65,6 +70,6 @@ cargo clippy --all-targets -- -D warnings
 
 To measure scrolling without opening a window or touching the radio, run `cargo test scroll_rendering -- --ignored --nocapture`. This opt-in benchmark scrolls the actual Monitoring and Discover screens, including 250 synthetic networks and 500 clients, into an in-memory software framebuffer. It reports warmed layout and full-redraw timings, excluding compositor presentation. The app polls job output while jobs run and sleeps between input events when idle.
 
-Tests use synthetic scan data, simulated adapters, and fake local subprocesses. They cover cancellation, adapter handoff, partial setup failure, restoration retries, and misleading tool exit codes. They do not scan, transmit packets, change interfaces, or attempt password recovery against real captures. Hardware behavior needs validation on a research adapter and test AP.
+Tests use synthetic scan data, simulated adapters, and fake local subprocesses. They cover session authorization reuse, concurrent jobs, authorization cancellation, helper failure and shutdown, adapter handoff, partial setup failure, restoration retries, and misleading tool exit codes. They do not request real desktop authorization, scan, transmit packets, change interfaces, or attempt password recovery against real captures. Hardware behavior needs validation on a research adapter and test AP.
 
 Command formats follow the [Aircrack-ng documentation](https://www.aircrack-ng.org/documentation.html) and [Hashcat WPA recovery documentation](https://hashcat.net/wiki/doku.php?id=cracking_wpawpa2). UI APIs follow [iced 0.14](https://docs.rs/iced/0.14.0/iced/).

@@ -5,8 +5,9 @@ use crate::{
 };
 use nix::{
     sys::signal::{Signal, killpg},
-    unistd::{Pid, geteuid},
+    unistd::Pid,
 };
+
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -22,6 +23,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+mod session;
+pub use session::{Authorization, session_worker_main};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Event {
@@ -40,6 +44,24 @@ struct Request {
     #[serde(default)]
     nmcli: Option<PathBuf>,
     operation: Operation,
+}
+
+impl Request {
+    fn validate(&self) -> Result<(), String> {
+        let spec = self.operation.spec()?;
+        self.operation.validate_files()?;
+        if !self.executable.is_absolute()
+            || self.executable.file_name().and_then(|v| v.to_str()) != Some(spec.tool.name())
+        {
+            return Err("The worker requires an absolute path to the selected tool.".into());
+        }
+        if self.nmcli.as_ref().is_some_and(|path| {
+            !path.is_absolute() || path.file_name().and_then(|name| name.to_str()) != Some("nmcli")
+        }) {
+            return Err("The worker requires an absolute path to nmcli.".into());
+        }
+        Ok(())
+    }
 }
 
 pub struct Job {
@@ -66,12 +88,31 @@ impl Drop for Job {
 pub struct Runner {
     pub events: Receiver<(u64, Event)>,
     sender: SyncSender<(u64, Event)>,
+    session: Option<session::Session>,
+    pub authorization: Option<iced::futures::channel::mpsc::UnboundedReceiver<Authorization>>,
 }
 
 impl Runner {
-    pub fn new() -> Self {
+    pub fn new(demo: bool) -> Self {
         let (sender, events) = mpsc::sync_channel(512);
-        Self { events, sender }
+        let (updates, authorization) = iced::futures::channel::mpsc::unbounded();
+        let session = if demo {
+            None
+        } else {
+            match session::Session::new(sender.clone(), updates.clone()) {
+                Ok(session) => Some(session),
+                Err(error) => {
+                    let _ = updates.unbounded_send(Authorization::Failed(error));
+                    None
+                }
+            }
+        };
+        Self {
+            events,
+            sender,
+            session,
+            authorization: Some(authorization),
+        }
     }
 
     pub fn start(&self, id: u64, operation: Operation, demo: bool) -> Result<Job, String> {
@@ -112,12 +153,6 @@ impl Runner {
             operation.validate_files()?;
             let executable = find_tool(spec.tool.name())
                 .ok_or_else(|| format!("{} is missing from PATH.", spec.tool.name()))?;
-            let helper = std::env::current_exe().map_err(|e| e.to_string())?;
-            let pkexec = if spec.privileged && !geteuid().is_root() {
-                Some(find_tool("pkexec").ok_or("Install polkit (pkexec) and a desktop authentication agent for radio operations.")?)
-            } else {
-                None
-            };
             let request = Request {
                 executable,
                 nmcli: if matches!(operation, Operation::Monitor { .. }) {
@@ -127,11 +162,21 @@ impl Runner {
                 },
                 operation: operation.clone(),
             };
-            thread::spawn(move || {
-                if let Err(error) = run_helper(id, request, helper, pkexec, flag, &sender) {
-                    let _ = sender.send((id, Event::Error(error)));
-                }
-            });
+            if spec.privileged {
+                self.session
+                    .as_ref()
+                    .ok_or(
+                        "The privileged session is unavailable. Restart the app to authorize it.",
+                    )?
+                    .start(id, request, flag)?;
+            } else {
+                let helper = std::env::current_exe().map_err(|e| e.to_string())?;
+                thread::spawn(move || {
+                    if let Err(error) = run_helper(id, request, helper, flag, &sender) {
+                        let _ = sender.send((id, Event::Error(error)));
+                    }
+                });
+            }
         }
         Ok(Job {
             id,
@@ -141,24 +186,20 @@ impl Runner {
             cancel,
         })
     }
+
+    pub fn shutdown(&self) -> bool {
+        self.session.as_ref().is_none_or(session::Session::close)
+    }
 }
 
 fn run_helper(
     id: u64,
     request: Request,
     helper: PathBuf,
-    pkexec: Option<PathBuf>,
     cancel: Arc<AtomicBool>,
     sender: &SyncSender<(u64, Event)>,
 ) -> Result<(), String> {
-    let mut command = if let Some(pkexec) = pkexec {
-        let mut cmd = Command::new(pkexec);
-        cmd.arg(helper);
-        cmd
-    } else {
-        Command::new(helper)
-    };
-    let mut child = command
+    let mut child = Command::new(helper)
         .arg("--worker")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -221,7 +262,7 @@ fn run_helper(
         if !worker_started.load(Ordering::Relaxed)
             && stopping.is_some_and(|at| at.elapsed() > Duration::from_secs(8))
         {
-            // Close a pending pkexec authorization dialog as well.
+            // Stop a worker that never reached command execution.
             let _ = child.kill();
         }
         thread::sleep(Duration::from_millis(50));
@@ -240,7 +281,7 @@ fn run_helper(
             ));
         } else {
             return Err(format!(
-                "Worker exited ({status}). Check the log and the polkit authentication agent."
+                "Worker exited ({status}). Check the command output."
             ));
         }
     }
@@ -265,18 +306,7 @@ pub fn worker_main() -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let request: Request =
         serde_json::from_str(&line).map_err(|e| format!("Invalid worker request: {e}"))?;
-    let spec = request.operation.spec()?;
-    request.operation.validate_files()?;
-    if !request.executable.is_absolute()
-        || request.executable.file_name().and_then(|v| v.to_str()) != Some(spec.tool.name())
-    {
-        return Err("The worker requires an absolute path to the selected tool.".into());
-    }
-    if request.nmcli.as_ref().is_some_and(|path| {
-        !path.is_absolute() || path.file_name().and_then(|name| name.to_str()) != Some("nmcli")
-    }) {
-        return Err("The worker requires an absolute path to nmcli.".into());
-    }
+    request.validate()?;
     let cancelled = Arc::new(AtomicBool::new(false));
     let flag = cancelled.clone();
     thread::spawn(move || {

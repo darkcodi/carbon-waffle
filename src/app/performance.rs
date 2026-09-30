@@ -7,8 +7,7 @@ use iced_tiny_skia::graphics::Viewport;
 use std::time::Instant;
 
 fn populated_app() -> App {
-    let mut app = App::new();
-    app.demo = true;
+    let mut app = App::new(true);
     app.interfaces = vec![Interface {
         name: "wlan0mon".into(),
         phy: "phy0".into(),
