@@ -7,7 +7,7 @@ cargo run -- --demo
 cargo run
 ```
 
-Demo mode uses synthetic networks and simulated jobs. It never executes the wireless tools or writes captures. You can also switch modes from the window when no jobs or adapter restoration are pending.
+Demo mode is selected with `--demo` at launch and uses synthetic networks and simulated jobs. It never executes the wireless tools or writes captures.
 
 ## Requirements
 
@@ -18,7 +18,7 @@ Demo mode uses synthetic networks and simulated jobs. It never executes the wire
 - `pkexec` (polkit) and a running desktop polkit authentication agent for privileged radio operations.
 - An adapter/driver supporting monitor mode; injection support for deauthentication.
 
-The **Adapter & tool details** section in Monitoring reports detected executables. On NixOS, `nix-shell` provides build and GUI runtime libraries, plus the external tools. Desktop polkit configuration still comes from your system.
+The **Prerequisites** section in Monitoring reports detected executables. On NixOS, `nix-shell` provides build and GUI runtime libraries, plus the external tools. Desktop polkit configuration still comes from your system.
 
 The UI renders on the CPU with tiny-skia; it does not require Vulkan, OpenGL, or GPU drivers for rendering. Development builds optimize rasterization and text shaping so ordinary `cargo run` avoids the large scrolling stalls of an unoptimized renderer. The first build takes longer; subsequent app-only rebuilds reuse the optimized dependencies. This keeps the rendering stack suitable for portable packaging such as AppImage.
 
@@ -38,7 +38,7 @@ Open **Activity** at the bottom to inspect command output. Every command retains
 
 Capture and recovery files are retained under `captures/session-…/`, with private session directories. Capture files created by elevated tools may be root-owned. Recovered secrets may appear in CLI output and result files. Nothing is uploaded. Hashcat uses a session-local potfile; the GUI reports its exit status and result path rather than interpreting all progress/result formats.
 
-The adapter handoff does not run `airmon-ng check kill` or restart system networking services; other adapters stay managed. Adapters that were already unmanaged are not assigned to NetworkManager afterward. Without `nmcli`, the selected adapter must already be free of network management. Independent supplicants or other network managers can still interfere; **Check interfering processes** and Activity expose their diagnostics. A separate research adapter is useful when you need to keep a network connection.
+The adapter handoff does not run `airmon-ng check kill` or restart system networking services; other adapters stay managed. Adapters that were already unmanaged are not assigned to NetworkManager afterward. Without `nmcli`, the selected adapter must already be free of network management. Independent supplicants or other network managers can still interfere; Activity exposes the tool diagnostics. A separate research adapter is useful when you need to keep a network connection.
 
 ## Implementation
 

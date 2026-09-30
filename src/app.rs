@@ -69,7 +69,6 @@ struct Panels {
 pub enum Action {
     Monitor,
     Restore,
-    Check,
     Scan,
     Capture,
     Deauth,
@@ -84,7 +83,6 @@ pub enum Message {
     Page(Page),
     Interface(Interface),
     Refresh,
-    Demo,
     Select(String),
     Filter(String),
     Station(String),
@@ -393,7 +391,6 @@ impl App {
                 })
             }
             Action::Restore => self.restoration_operation(),
-            Action::Check => Ok(Operation::Check),
             Action::Scan => Ok(Operation::Scan {
                 interface: monitor()?,
                 prefix: path("survey"),
@@ -508,14 +505,6 @@ impl App {
                 .jobs
                 .iter()
                 .any(|j| matches!(j.operation, Operation::Deauth { .. }))
-        {
-            return;
-        }
-        if matches!(action, Action::Check)
-            && self
-                .jobs
-                .iter()
-                .any(|j| matches!(j.operation, Operation::Check))
         {
             return;
         }
@@ -733,34 +722,6 @@ impl App {
                     self.refresh();
                 }
             }
-            Message::Demo => {
-                if self.jobs.is_empty()
-                    && self.owned_monitor.is_none()
-                    && self.network_restore.is_none()
-                {
-                    self.demo = !self.demo;
-                    self.page = Page::Monitoring;
-                    self.panels = Panels::default();
-                    self.status_error = false;
-                    self.interfaces.clear();
-                    self.interface = None;
-                    self.survey = Survey::default();
-                    self.target = None;
-                    self.capture_path.clear();
-                    self.hash_path.clear();
-                    self.wordlist.clear();
-                    self.station.clear();
-                    self.pending = None;
-                    self.activity.clear();
-                    self.copied_activity = None;
-                    self.refresh();
-                    if self.demo {
-                        self.load_demo();
-                    } else {
-                        self.status = "Live mode · select your research adapter.".into();
-                    }
-                }
-            }
             Message::Select(bssid) => {
                 if (!self.radio_busy()
                     || self.jobs.iter().all(|j| {
@@ -889,16 +850,11 @@ mod tests {
     }
 
     #[test]
-    fn deauth_requires_capture_and_demo_cannot_switch_during_a_job() {
+    fn deauth_requires_capture() {
         let mut app = demo_app();
         app.run(Action::Deauth);
         assert!(app.jobs.is_empty());
         assert!(app.status.contains("Start a target capture"));
-        app.run(Action::Scan);
-        let _ = app.update(Message::Demo);
-        assert!(app.demo);
-        let _ = app.update(Message::StopAll);
-        pump_until(&mut app, |a| a.jobs.is_empty());
     }
 
     #[test]

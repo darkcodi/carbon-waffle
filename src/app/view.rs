@@ -15,43 +15,11 @@ impl App {
 
     pub fn view(&self) -> Element<'_, Message> {
         let header = row![
-            row![
-                text("carbon").font(style::SEMIBOLD).size(21),
-                text("waffle").color(style::MUTED).size(21)
-            ]
-            .spacing(5),
-            widget::space().width(Fill),
-            text(if self.demo {
-                "Demo session"
-            } else {
-                "Live session"
-            })
-            .size(12)
-            .color(if self.demo {
-                style::MUTED
-            } else {
-                style::ACCENT
-            }),
-            button(
-                text(if self.demo {
-                    "Use live mode"
-                } else {
-                    "Try demo"
-                })
-                .size(12)
-            )
-            .on_press_maybe(
-                (self.jobs.is_empty()
-                    && self.owned_monitor.is_none()
-                    && self.network_restore.is_none()
-                    && !self.closing)
-                    .then_some(Message::Demo)
-            )
-            .style(style::secondary)
-            .padding([8, 12]),
+            text("carbon").font(style::SEMIBOLD).size(21),
+            text("waffle").color(style::MUTED).size(21),
         ]
         .align_y(Center)
-        .spacing(14);
+        .spacing(5);
 
         let screen = match self.page {
             Page::Monitoring => self.monitoring(),
@@ -293,11 +261,7 @@ impl App {
                 .width(Fill),
             );
         }
-        content = content.push(disclosure(
-            "Adapter & tool details",
-            self.panels.tools,
-            Panel::Tools,
-        ));
+        content = content.push(disclosure("Prerequisites", self.panels.tools, Panel::Tools));
         if self.panels.tools {
             let tools = self
                 .tools
@@ -321,10 +285,7 @@ impl App {
                         .align_y(Center),
                     )
                 });
-            content = content.push(container(column![tools,
-                self.action("Check interfering processes", Action::Check, idle).style(style::secondary).width(Fill),
-                text("The selected adapter is temporarily released from NetworkManager. Other adapters and networking services stay running.").size(12).color(style::MUTED),
-            ].spacing(18)).padding(20).width(Fill).style(style::card));
+            content = content.push(container(tools).padding(20).width(Fill).style(style::card));
         }
         container(content).width(Fill).max_width(490).into()
     }
