@@ -87,6 +87,7 @@ impl App {
                     ..Default::default()
                 }),
             stage,
+            self.navigation(),
             widget::rule::horizontal(1).style(style::divider),
             footer,
         ]
@@ -117,6 +118,12 @@ impl App {
                 );
             }
             let active = self.page == page;
+            let available = self.can_select_page(page);
+            let inactive_color = if available {
+                style::MUTED
+            } else {
+                style::MUTED.scale_alpha(0.4)
+            };
             let circle = container(
                 text((index + 1).to_string())
                     .font(style::SEMIBOLD)
@@ -124,7 +131,7 @@ impl App {
                     .color(if active {
                         style::BACKGROUND
                     } else {
-                        style::MUTED
+                        inactive_color
                     }),
             )
             .center_x(64)
@@ -132,7 +139,13 @@ impl App {
             .style(move |_| container::Style {
                 background: active.then_some(style::ACCENT.into()),
                 border: Border {
-                    color: if active { style::ACCENT } else { style::LINE },
+                    color: if active {
+                        style::ACCENT
+                    } else if available {
+                        style::LINE
+                    } else {
+                        style::LINE.scale_alpha(0.45)
+                    },
                     width: 2.0,
                     radius: 32.0.into(),
                 },
@@ -152,7 +165,7 @@ impl App {
                             .color(if active {
                                 style::FOREGROUND
                             } else {
-                                style::MUTED
+                                inactive_color
                             }),
                     ]
                     .align_x(Center)
@@ -160,11 +173,53 @@ impl App {
                     .width(118),
                 )
                 .padding([6, 0])
-                .on_press_maybe((!self.closing).then_some(Message::Page(page)))
+                .on_press_maybe(available.then_some(Message::Page(page)))
                 .style(style::quiet),
             );
         }
         container(steps).max_width(820).width(Fill).into()
+    }
+
+    fn navigation(&self) -> Element<'_, Message> {
+        let back = button(
+            row![
+                text("←").size(17),
+                text("Back").size(14).font(style::SEMIBOLD)
+            ]
+            .spacing(16)
+            .align_y(Center),
+        )
+        .width(120)
+        .padding([12, 20])
+        .on_press_maybe(self.can_go_back().then_some(Message::Back))
+        .style(style::secondary);
+        let next = button(
+            row![
+                text("Next").size(14).font(style::SEMIBOLD).width(Fill),
+                text("→").size(17),
+            ]
+            .spacing(16)
+            .align_y(Center),
+        )
+        .width(120)
+        .padding([12, 20])
+        .on_press_maybe(self.can_advance().then_some(Message::Next))
+        .style(|theme, status| {
+            if status == button::Status::Disabled {
+                style::secondary(theme, status)
+            } else {
+                style::primary(theme, status)
+            }
+        });
+        let mut navigation = row![].align_y(Center).width(Fill);
+        if self.page.previous().is_some() {
+            navigation = navigation.push(back);
+        }
+        navigation = navigation.push(widget::space().width(Fill));
+        if self.page.next().is_some() {
+            navigation = navigation.push(next);
+        }
+        container(navigation).padding([8, 14]).width(Fill).into()
     }
 
     fn elevate(&self) -> Element<'_, Message> {
@@ -287,10 +342,10 @@ impl App {
             .interface
             .as_ref()
             .is_some_and(|interface| interface.monitor);
-        let mode_job = self
+        let changing_mode = self
             .jobs
             .iter()
-            .find(|job| matches!(job.operation, Operation::Monitor { .. }));
+            .any(|job| matches!(job.operation, Operation::Monitor { .. }));
         let adapter: Element<'_, Message> = if idle {
             pick_list(
                 self.interfaces.clone(),
@@ -349,18 +404,14 @@ impl App {
         .spacing(30)
         .width(Fill);
 
-        if let Some(job) = mode_job {
-            content = content.push(self.job_strip(job));
+        if changing_mode {
+            content = content.push(container(self.spinner()).center_x(Fill).center_y(48));
         } else if monitor {
-            content = content
-                .push(self.next("Continue to Discover", Page::Discover, true))
-                .push(
-                    container(
-                        self.action("Restore managed mode", Action::Restore, idle)
-                            .style(style::quiet),
-                    )
-                    .center_x(Fill),
-                );
+            content = content.push(
+                self.action("Restore managed mode", Action::Restore, idle)
+                    .width(Fill)
+                    .style(style::quiet),
+            );
         } else if self.network_restore.is_some() || self.owned_monitor.is_some() {
             content = content.push(
                 self.action("Restore managed mode", Action::Restore, idle)
@@ -377,6 +428,35 @@ impl App {
             );
         }
         container(content).width(Fill).max_width(490).into()
+    }
+
+    fn spinner(&self) -> Element<'_, Message> {
+        let dots = (0..8).map(|index| {
+            let angle = index as f32 * std::f32::consts::TAU / 8.0 - std::f32::consts::FRAC_PI_2;
+            let age = (self.spinner_frame + 8 - index) % 8;
+            let color = style::ACCENT.scale_alpha(1.0 - age as f32 / 8.0 * 0.85);
+            let dot = container(widget::space())
+                .width(4)
+                .height(4)
+                .style(move |_| container::Style {
+                    background: Some(color.into()),
+                    border: Border {
+                        radius: 2.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+            container(dot)
+                .padding(iced::Padding {
+                    top: 10.0 + angle.sin() * 10.0,
+                    left: 10.0 + angle.cos() * 10.0,
+                    ..Default::default()
+                })
+                .width(Fill)
+                .height(Fill)
+                .into()
+        });
+        widget::stack(dots).width(24).height(24).into()
     }
 
     fn discover(&self) -> Element<'_, Message> {
@@ -549,15 +629,7 @@ impl App {
                 .size(12)
                 .color(style::MUTED),
             )
-            .push(networks)
-            .push(
-                row![
-                    link("Back", Message::Page(Page::Monitoring)),
-                    widget::space().width(Fill),
-                    self.next("Continue to Capture", Page::Capture, self.target.is_some()),
-                ]
-                .align_y(Center),
-            );
+            .push(networks);
         container(content).max_width(780).width(Fill).into()
     }
 
@@ -672,18 +744,6 @@ impl App {
                 text("Stop recording before inspection. The command output reports whether a usable handshake was captured.").size(12).color(style::MUTED),
             ].spacing(12));
         }
-        content = content.push(
-            row![
-                link("Back", Message::Page(Page::Discover)),
-                widget::space().width(Fill),
-                self.next(
-                    "Continue to Recover",
-                    Page::Recover,
-                    !self.capture_path.is_empty() && !self.radio_busy()
-                ),
-            ]
-            .align_y(Center),
-        );
         container(content).max_width(590).width(Fill).into()
     }
 
@@ -842,7 +902,6 @@ impl App {
         }
         content = content.push(
             row![
-                link("Back to Capture", Message::Page(Page::Capture)),
                 widget::space().width(Fill),
                 link(
                     if self.panels.session {
@@ -947,20 +1006,6 @@ impl App {
                 && self.pending.is_none())
             .then_some(Message::Run(action)),
         )
-        .style(style::primary)
-    }
-
-    fn next<'a>(&self, label: &'a str, page: Page, enabled: bool) -> widget::Button<'a, Message> {
-        button(
-            row![
-                text(label).size(14).font(style::SEMIBOLD).width(Fill),
-                text("→").size(17)
-            ]
-            .spacing(24)
-            .align_y(Center),
-        )
-        .padding([14, 20])
-        .on_press_maybe((enabled && !self.closing).then_some(Message::Page(page)))
         .style(style::primary)
     }
 

@@ -19,7 +19,7 @@ mod view;
 #[cfg(test)]
 mod performance;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Page {
     Elevate,
     Monitoring,
@@ -45,6 +45,16 @@ impl Page {
             Self::Capture => "Capture",
             Self::Recover => "Recover",
         }
+    }
+
+    fn next(self) -> Option<Self> {
+        Self::ALL.get(self as usize + 1).copied()
+    }
+
+    fn previous(self) -> Option<Self> {
+        (self as usize)
+            .checked_sub(1)
+            .and_then(|index| Self::ALL.get(index).copied())
     }
 }
 
@@ -86,6 +96,8 @@ pub enum Message {
     Elevate,
     Authorization(Authorization),
     Page(Page),
+    Back,
+    Next,
     Interface(Interface),
     Refresh,
     Select(String),
@@ -142,6 +154,7 @@ pub struct App {
     station: String,
     count: String,
     capture_path: String,
+    capture_available: bool,
     hash_path: String,
     wordlist: String,
     engine: Engine,
@@ -154,6 +167,7 @@ pub struct App {
     session: PathBuf,
     activity: Vec<CommandActivity>,
     copied_activity: Option<u64>,
+    spinner_frame: u8,
     status: String,
     status_error: bool,
     panels: Panels,
@@ -192,6 +206,7 @@ impl App {
             station: String::new(),
             count: "5".into(),
             capture_path: String::new(),
+            capture_available: false,
             hash_path: String::new(),
             wordlist: String::new(),
             engine: Engine::Aircrack,
@@ -211,6 +226,7 @@ impl App {
             session,
             activity: vec![],
             copied_activity: None,
+            spinner_frame: 0,
             status: "Elevate permissions to begin.".into(),
             status_error: false,
             panels: Panels::default(),
@@ -302,6 +318,57 @@ impl App {
         })
     }
 
+    fn can_select_page(&self, page: Page) -> bool {
+        !self.closing && page <= self.page
+    }
+
+    fn can_go_back(&self) -> bool {
+        !self.closing && self.page.previous().is_some()
+    }
+
+    fn can_advance(&self) -> bool {
+        if self.closing || self.pending.is_some() || self.authorization != Authorization::Ready {
+            return false;
+        }
+        let monitor_ready = self.interface.as_ref().is_some_and(|iface| iface.monitor)
+            && !self
+                .jobs
+                .iter()
+                .any(|job| matches!(job.operation, Operation::Monitor { .. }));
+        match self.page {
+            Page::Elevate => true,
+            Page::Monitoring => monitor_ready,
+            Page::Discover => monitor_ready && self.target.is_some(),
+            Page::Capture => {
+                self.target.is_some()
+                    && self.capture_available
+                    && !self.radio_busy()
+                    && !self.offline_busy()
+            }
+            Page::Recover => false,
+        }
+    }
+
+    fn show_page(&mut self, page: Page) -> Task<Message> {
+        self.page = page;
+        iced::widget::operation::scroll_to(
+            "current-step",
+            iced::widget::operation::AbsoluteOffset { x: 0.0, y: 0.0 },
+        )
+    }
+
+    fn refresh_capture_available(&mut self) {
+        // Cache file checks on input/job events; scrolling must never stat files.
+        self.capture_available = if self.demo {
+            !self.capture_path.trim().is_empty()
+        } else {
+            absolute_path(&self.capture_path)
+                .ok()
+                .and_then(|path| fs::metadata(path).ok())
+                .is_some_and(|metadata| metadata.is_file() && metadata.len() > 0)
+        };
+    }
+
     fn launch(&mut self, operation: Operation) {
         let spec = match operation.spec() {
             Ok(spec) => spec,
@@ -349,6 +416,7 @@ impl App {
                 );
                 if let Operation::Capture { prefix, .. } = &operation {
                     self.capture_path = format!("{}-01.cap", prefix.display());
+                    self.capture_available = false;
                     self.hash_path.clear();
                 }
                 self.jobs.push(job);
@@ -647,6 +715,11 @@ impl App {
                     }
                 }
             }
+            Operation::Capture { .. } | Operation::Inspect { .. } => {
+                if !self.demo || ok || cancelled {
+                    self.refresh_capture_available();
+                }
+            }
             Operation::Convert { output, .. } if ok => {
                 if self.demo || fs::metadata(output).is_ok_and(|m| m.len() > 0) {
                     self.hash_path = output.to_string_lossy().into_owned();
@@ -715,6 +788,14 @@ impl App {
                 self.authorization = authorization;
             }
             Message::Tick => {
+                if self.page == Page::Monitoring
+                    && self
+                        .jobs
+                        .iter()
+                        .any(|job| matches!(job.operation, Operation::Monitor { .. }))
+                {
+                    self.spinner_frame = (self.spinner_frame + 1) % 8;
+                }
                 let events: Vec<_> = self.runner.events.try_iter().take(512).collect();
                 for (id, event) in events {
                     match event {
@@ -761,11 +842,22 @@ impl App {
                 }
             }
             Message::Page(page) => {
-                self.page = page;
-                return iced::widget::operation::scroll_to(
-                    "current-step",
-                    iced::widget::operation::AbsoluteOffset { x: 0.0, y: 0.0 },
-                );
+                if self.can_select_page(page) {
+                    return self.show_page(page);
+                }
+            }
+            Message::Back => {
+                if self.can_go_back() {
+                    return self.show_page(self.page.previous().unwrap());
+                }
+            }
+            Message::Next => {
+                if self.page == Page::Capture && !self.demo {
+                    self.refresh_capture_available();
+                }
+                if self.can_advance() {
+                    return self.show_page(self.page.next().unwrap());
+                }
             }
             Message::Interface(interface) => {
                 if !self.radio_busy() {
@@ -775,6 +867,7 @@ impl App {
             Message::Refresh => {
                 if !self.radio_busy() {
                     self.refresh();
+                    self.refresh_capture_available();
                 }
             }
             Message::Select(bssid) => {
@@ -784,6 +877,15 @@ impl App {
                     }))
                     && let Some(network) = self.survey.networks.iter().find(|n| n.bssid == bssid)
                 {
+                    if self
+                        .target
+                        .as_ref()
+                        .is_none_or(|target| target.bssid != bssid)
+                    {
+                        self.capture_path.clear();
+                        self.capture_available = false;
+                        self.hash_path.clear();
+                    }
                     self.target = Some(network.clone());
                     self.station.clear();
                 }
@@ -791,7 +893,10 @@ impl App {
             Message::Filter(value) => self.filter = value,
             Message::Station(value) => self.station = value,
             Message::Count(value) => self.count = value,
-            Message::CapturePath(value) => self.capture_path = value,
+            Message::CapturePath(value) => {
+                self.capture_path = value;
+                self.refresh_capture_available();
+            }
             Message::HashPath(value) => self.hash_path = value,
             Message::Wordlist(value) => self.wordlist = value,
             Message::Engine(value) => self.engine = value,
@@ -984,5 +1089,131 @@ mod tests {
         app.run(Action::Scan);
         assert!(app.jobs.is_empty());
         assert_eq!(app.subscription().units(), 1);
+    }
+
+    #[test]
+    fn navigation_requires_completion_and_step_shortcuts_only_go_back() {
+        let mut app = demo_app();
+        app.authorization = Authorization::Idle;
+        assert!(!app.can_go_back());
+        let _ = app.update(Message::Back);
+        let _ = app.update(Message::Next);
+        assert_eq!(app.page, Page::Elevate);
+        let _ = app.update(Message::Authorization(Authorization::Ready));
+        assert!(app.can_advance());
+        // Even completed prerequisites never make a future step clickable.
+        for page in Page::ALL.into_iter().skip(1) {
+            assert!(!app.can_select_page(page));
+            let _ = app.update(Message::Page(page));
+            assert_eq!(app.page, Page::Elevate);
+        }
+        let _ = app.update(Message::Next);
+        assert_eq!(app.page, Page::Monitoring);
+        let _ = app.update(Message::Next);
+        assert_eq!(app.page, Page::Discover);
+        app.target = None;
+        assert!(!app.can_advance());
+        let _ = app.update(Message::Next);
+        assert_eq!(app.page, Page::Discover);
+        let bssid = app.survey.networks[0].bssid.clone();
+        let _ = app.update(Message::Select(bssid));
+        let _ = app.update(Message::Next);
+        assert_eq!(app.page, Page::Capture);
+        assert!(!app.can_advance());
+        let _ = app.update(Message::Authorization(Authorization::Failed(
+            "Session ended".into(),
+        )));
+        // Losing prerequisites does not prevent returning to fix them.
+        let _ = app.update(Message::Back);
+        assert_eq!(app.page, Page::Discover);
+        assert!(!app.can_advance());
+        let _ = app.update(Message::Page(Page::Elevate));
+        assert_eq!(app.page, Page::Elevate);
+        let _ = app.update(Message::Page(Page::Discover));
+        assert_eq!(app.page, Page::Elevate);
+        let _ = app.update(Message::Authorization(Authorization::Ready));
+        let _ = app.update(Message::Next);
+        app.interface.as_mut().unwrap().monitor = false;
+        let _ = app.update(Message::Next);
+        assert_eq!(app.page, Page::Monitoring);
+        let _ = app.update(Message::Close);
+        assert!(!app.can_go_back());
+        let _ = app.update(Message::Back);
+        let _ = app.update(Message::Page(Page::Elevate));
+        assert_eq!(app.page, Page::Monitoring);
+    }
+
+    #[test]
+    fn navigation_waits_for_monitor_setup_and_capture_shutdown() {
+        let mut app = App::new(true);
+        app.target = None;
+        let _ = app.update(Message::Next);
+        assert_eq!(app.page, Page::Monitoring);
+        assert!(!app.can_advance());
+        app.run(Action::Monitor);
+        // A monitor interface can appear before the setup job has completed.
+        app.interface.as_mut().unwrap().monitor = true;
+        assert!(!app.can_advance());
+        pump_until(&mut app, |app| app.jobs.is_empty());
+        assert!(app.can_advance());
+        let _ = app.update(Message::Next);
+        app.run(Action::Scan);
+        assert!(!app.can_advance());
+        let bssid = app.survey.networks[0].bssid.clone();
+        let _ = app.update(Message::Select(bssid));
+        let _ = app.update(Message::Next);
+        assert_eq!(app.page, Page::Capture);
+        app.run(Action::Capture);
+        assert!(app.pending.is_some());
+        assert!(!app.can_advance());
+        pump_until(&mut app, App::capture_running);
+        assert!(!app.capture_path.is_empty());
+        let _ = app.update(Message::Next);
+        assert_eq!(app.page, Page::Capture);
+        let _ = app.update(Message::StopAll);
+        assert!(!app.can_advance());
+        pump_until(&mut app, |app| app.jobs.is_empty());
+        assert!(app.can_advance());
+        let _ = app.update(Message::Next);
+        assert_eq!(app.page, Page::Recover);
+        assert!(!app.can_advance());
+        let _ = app.update(Message::Next);
+        assert_eq!(app.page, Page::Recover);
+        let _ = app.update(Message::Back);
+        assert_eq!(app.page, Page::Capture);
+        assert!(app.can_advance());
+        let _ = app.update(Message::Page(Page::Discover));
+        let bssid = app.survey.networks[1].bssid.clone();
+        let _ = app.update(Message::Select(bssid));
+        let _ = app.update(Message::Next);
+        assert_eq!(app.page, Page::Capture);
+        assert!(!app.can_advance());
+        assert!(app.capture_path.is_empty());
+    }
+
+    #[test]
+    fn recovery_requires_a_nonempty_file_and_rechecks_it_on_next() {
+        let mut app = demo_app();
+        app.demo = false; // Validate real files without starting any subprocess.
+        app.page = Page::Capture;
+        let dir = tempfile::tempdir().unwrap();
+        let capture = dir.path().join("test.cap");
+        for path in [&capture, dir.path()] {
+            let _ = app.update(Message::CapturePath(path.to_string_lossy().into_owned()));
+            assert!(!app.can_advance());
+        }
+        fs::write(&capture, []).unwrap();
+        let _ = app.update(Message::CapturePath(capture.to_string_lossy().into_owned()));
+        assert!(!app.can_advance());
+        fs::write(&capture, b"synthetic capture data").unwrap();
+        let _ = app.update(Message::CapturePath(capture.to_string_lossy().into_owned()));
+        assert!(app.can_advance());
+        fs::remove_file(&capture).unwrap();
+        let _ = app.update(Message::Next);
+        assert_eq!(app.page, Page::Capture);
+        assert!(!app.can_advance());
+        fs::write(&capture, b"synthetic capture data").unwrap();
+        let _ = app.update(Message::Next);
+        assert_eq!(app.page, Page::Recover);
     }
 }
