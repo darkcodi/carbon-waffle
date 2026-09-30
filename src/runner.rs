@@ -238,7 +238,8 @@ fn run_helper(
                 if matches!(event, Event::Finished { .. } | Event::Error(_)) {
                     seen.store(true, Ordering::Relaxed);
                 }
-                if matches!(event, Event::Line(_) | Event::Survey(_)) {
+                // Only Activity text is disposable when its queue is full.
+                if matches!(event, Event::Line(_)) {
                     let _ = tx.try_send((id, event));
                 } else if tx.send((id, event)).is_err() {
                     break;
@@ -470,7 +471,9 @@ fn run_process(
     let mut stopped_at = None;
     let started_at = Instant::now();
     let mut timed_out = false;
-    let mut last_snapshot = Instant::now() - Duration::from_secs(2);
+    let snapshot_interval = Duration::from_millis(100);
+    let mut last_snapshot = Instant::now() - snapshot_interval;
+    let mut last_survey = None;
     let status = loop {
         timed_out |= timeout.is_some_and(|limit| started_at.elapsed() >= limit);
         if (cancel.load(Ordering::Relaxed) || timed_out) && stopped_at.is_none() {
@@ -480,9 +483,9 @@ fn run_process(
         if stopped_at.is_some_and(|at| at.elapsed() > Duration::from_secs(3)) {
             let _ = killpg(group, Signal::SIGKILL);
         }
-        if last_snapshot.elapsed() >= Duration::from_secs(1) {
+        if last_snapshot.elapsed() >= snapshot_interval {
             if let Some(operation) = operation {
-                snapshot(operation, &*sink);
+                snapshot(operation, &mut last_survey, &*sink);
             }
             last_snapshot = Instant::now();
         }
@@ -502,7 +505,7 @@ fn run_process(
     let stdout = reader.join().unwrap_or_default();
     let _ = errors.join();
     if let Some(operation) = operation {
-        snapshot(operation, &*sink);
+        snapshot(operation, &mut last_survey, &*sink);
     }
     if timed_out {
         return Err(format!(
@@ -517,15 +520,16 @@ fn run_process(
     })
 }
 
-fn snapshot(operation: &Operation, sink: &impl Fn(Event)) {
+fn snapshot(operation: &Operation, last_survey: &mut Option<Survey>, sink: &impl Fn(Event)) {
     if let Some(path) = operation.csv_path()
         && let Ok(file) = fs::File::open(path)
     {
         let mut bytes = Vec::new();
         if file.take(4 * 1024 * 1024).read_to_end(&mut bytes).is_ok() {
             let survey = parse_survey(&String::from_utf8_lossy(&bytes));
-            // Airodump truncates the snapshot before rewriting it.
-            if !survey.networks.is_empty() {
+            // Ignore empty rewrites and avoid redrawing unchanged results.
+            if !survey.networks.is_empty() && last_survey.as_ref() != Some(&survey) {
+                *last_survey = Some(survey.clone());
                 sink(Event::Survey(survey));
             }
         }
@@ -564,6 +568,85 @@ fn read_output(reader: impl Read, mut sink: impl FnMut(String)) {
 mod tests {
     use super::*;
     use std::{os::unix::fs::PermissionsExt, sync::Mutex};
+
+    const SCAN_CSV: &str = "02:11:22:33:44:55, first, last, 6, 54, WPA2, CCMP, PSK, -40, 20, 0, 0.0.0.0, 7, Lab One, \n";
+
+    #[test]
+    fn snapshots_publish_changes_and_preserve_results_during_empty_rewrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let operation = Operation::Scan {
+            interface: "testmon".into(),
+            prefix: dir.path().join("survey"),
+        };
+        let path = operation.csv_path().unwrap();
+        let received = Mutex::new(Vec::new());
+        let sink = |event| {
+            if let Event::Survey(survey) = event {
+                received.lock().unwrap().push(survey);
+            }
+        };
+        let mut last_survey = None;
+        snapshot(&operation, &mut last_survey, &sink);
+        fs::write(&path, SCAN_CSV.trim_end_matches('\n')).unwrap();
+        snapshot(&operation, &mut last_survey, &sink);
+        assert!(received.lock().unwrap().is_empty());
+
+        fs::write(&path, SCAN_CSV).unwrap();
+        snapshot(&operation, &mut last_survey, &sink);
+        snapshot(&operation, &mut last_survey, &sink);
+        fs::write(&path, "").unwrap();
+        snapshot(&operation, &mut last_survey, &sink);
+        fs::write(&path, SCAN_CSV).unwrap();
+        snapshot(&operation, &mut last_survey, &sink);
+        assert_eq!(received.lock().unwrap().len(), 1);
+
+        fs::write(&path, SCAN_CSV.replace(", 20,", ", 21,")).unwrap();
+        snapshot(&operation, &mut last_survey, &sink);
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0].networks[0].ssid, "Lab One");
+        assert_eq!(received[1].networks[0].beacons, 21);
+    }
+
+    #[test]
+    fn running_scan_publishes_new_csv_without_waiting_a_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("fake-tool");
+        fs::write(&fake, "#!/bin/sh\nprintf 'ready\\n'\nsleep 30\n").unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+        let operation = Operation::Scan {
+            interface: "testmon".into(),
+            prefix: dir.path().join("survey"),
+        };
+        let path = operation.csv_path().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let (sender, received) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            run_process(
+                &fake,
+                &[],
+                Some(&operation),
+                flag,
+                Arc::new(move |event| {
+                    let _ = sender.send(event);
+                }),
+                None,
+            )
+        });
+        let ready = received.recv_timeout(Duration::from_secs(5));
+        // Publish after the initial, empty snapshot check has already happened.
+        thread::sleep(Duration::from_millis(150));
+        fs::write(&path, SCAN_CSV).unwrap();
+        let update = received.recv_timeout(Duration::from_millis(650));
+        cancel.store(true, Ordering::Relaxed);
+        handle.join().unwrap().unwrap();
+        assert!(matches!(ready, Ok(Event::Line(line)) if line == "ready"));
+        assert!(
+            matches!(update, Ok(Event::Survey(survey)) if survey.networks[0].ssid == "Lab One"),
+            "new networks must arrive promptly while the scan is still running"
+        );
+    }
 
     #[test]
     fn cancellation_reaps_process_group_and_handles_carriage_returns() {

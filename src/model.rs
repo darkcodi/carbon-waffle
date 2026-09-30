@@ -77,7 +77,7 @@ pub struct Station {
     pub packets: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Survey {
     pub networks: Vec<Network>,
     pub stations: Vec<Station>,

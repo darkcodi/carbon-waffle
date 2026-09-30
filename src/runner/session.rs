@@ -193,7 +193,8 @@ impl Connection {
                         if matches!(event, Event::Finished { .. } | Event::Error(_)) {
                             let _ = completed.send(id);
                         }
-                        if matches!(event, Event::Line(_) | Event::Survey(_)) {
+                        // Scan results must survive a full Activity queue.
+                        if matches!(event, Event::Line(_)) {
                             let _ = events.try_send((id, event));
                         } else if events.send((id, event)).is_err() {
                             break;
@@ -499,6 +500,90 @@ printf 'closed\n' > "$base/closed"
             "authorized\n"
         );
         assert!(dir.path().join("closed").exists());
+    }
+
+    #[test]
+    fn scan_results_survive_a_full_activity_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkexec = script(
+            &dir.path().join("pkexec"),
+            r#"
+base=$(dirname "$0")
+printf '"Ready"\n'
+IFS= read -r request
+cat "$base/packets"
+: > "$base/emitted"
+while IFS= read -r request; do :; done
+"#,
+        );
+        let mut packets = Vec::new();
+        for _ in 0..2000 {
+            write_packet(
+                &mut packets,
+                &Reply::Job {
+                    id: 1,
+                    event: Event::Line("busy scan output".into()),
+                },
+            )
+            .unwrap();
+        }
+        write_packet(
+            &mut packets,
+            &Reply::Job {
+                id: 1,
+                event: Event::Survey(crate::model::demo_survey()),
+            },
+        )
+        .unwrap();
+        write_packet(
+            &mut packets,
+            &Reply::Job {
+                id: 1,
+                event: Event::Finished {
+                    code: Some(0),
+                    cancelled: false,
+                },
+            },
+        )
+        .unwrap();
+        fs::write(dir.path().join("packets"), packets).unwrap();
+        let (events, received) = mpsc::sync_channel(8);
+        let (updates, mut authorization) = asynchronous::unbounded();
+        let session = Session::launch(
+            PathBuf::from("/unused/helper"),
+            Some(pkexec),
+            events,
+            updates,
+        );
+        assert_eq!(
+            wait_for(|| authorization.try_recv().ok()),
+            Authorization::Ready
+        );
+        session
+            .start(
+                1,
+                request(PathBuf::from("/unused/airmon-ng")),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+        // Let logs fill the queue before the UI drains it, as during layout.
+        wait_for(|| dir.path().join("emitted").exists().then_some(()));
+        thread::sleep(Duration::from_millis(200));
+        let mut saw_survey = false;
+        loop {
+            let (id, event) = received.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(id, 1);
+            match event {
+                Event::Survey(survey) => saw_survey = !survey.networks.is_empty(),
+                Event::Finished { .. } => break,
+                _ => {}
+            }
+        }
+        wait_for(|| session.close().then_some(()));
+        assert!(
+            saw_survey,
+            "scan results must not be dropped behind Activity logs"
+        );
     }
 
     #[test]
