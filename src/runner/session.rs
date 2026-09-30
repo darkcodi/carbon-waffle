@@ -19,6 +19,7 @@ use std::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Authorization {
+    Idle,
     Pending,
     Ready,
     Failed(String),
@@ -79,14 +80,11 @@ impl Session {
             incoming,
             ready: ready.clone(),
             shutdown: shutdown.clone(),
+            done: done.clone(),
             events,
             updates,
         };
-        let finished = done.clone();
-        thread::spawn(move || {
-            connection.run(helper, pkexec);
-            finished.store(true, Ordering::Release);
-        });
+        thread::spawn(move || connection.run(helper, pkexec));
         Self {
             submissions,
             ready,
@@ -97,7 +95,7 @@ impl Session {
 
     pub fn start(&self, id: u64, request: Request, cancel: Arc<AtomicBool>) -> Result<(), String> {
         if !self.ready.load(Ordering::Acquire) || self.shutdown.load(Ordering::Acquire) {
-            return Err("The privileged session is not authorized or has ended. Restart the app to authorize it.".into());
+            return Err("The privileged session is not authorized or has ended. Open Elevate to authorize it.".into());
         }
         self.submissions
             .send(Submission {
@@ -105,13 +103,15 @@ impl Session {
                 request,
                 cancel,
             })
-            .map_err(|_| {
-                "The privileged session has ended. Restart the app to authorize it.".into()
-            })
+            .map_err(|_| "The privileged session has ended. Open Elevate to authorize it.".into())
     }
 
     pub fn close(&self) -> bool {
         self.shutdown.store(true, Ordering::Release);
+        self.is_closed()
+    }
+
+    pub fn is_closed(&self) -> bool {
         self.done.load(Ordering::Acquire)
     }
 }
@@ -126,6 +126,7 @@ struct Connection {
     incoming: Receiver<Submission>,
     ready: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
     events: SyncSender<(u64, Event)>,
     updates: asynchronous::UnboundedSender<Authorization>,
 }
@@ -136,7 +137,7 @@ impl Connection {
         let result = self.communicate(helper, pkexec, &mut active);
         self.ready.store(false, Ordering::Release);
         let error = result.err().unwrap_or_else(|| {
-            "The privileged session ended. Restart the app to authorize it.".into()
+            "The privileged session ended. Open Elevate to authorize it.".into()
         });
         // Include submissions racing with helper failure, so no GUI job is left
         // waiting forever for a completion event.
@@ -146,6 +147,9 @@ impl Connection {
         for id in active.keys() {
             let _ = self.events.send((*id, Event::Error(error.clone())));
         }
+        // The helper and its readers have exited. Make retry available before
+        // notifying the UI, so an immediate click can start a fresh session.
+        self.done.store(true, Ordering::Release);
         if !self.shutdown.load(Ordering::Acquire) {
             let _ = self.updates.unbounded_send(Authorization::Failed(error));
         }
@@ -274,12 +278,10 @@ impl Connection {
             return Ok(());
         }
         if status.is_some_and(|status| status.code() == Some(126)) {
-            return Err(
-                "Authorization was cancelled. Restart the app to authorize a new session.".into(),
-            );
+            return Err("Authorization was cancelled. Try again in Elevate.".into());
         }
         Err(format!(
-            "The privileged session exited ({}). {} Restart the app to authorize a new session.",
+            "The privileged session exited ({}). {} Open Elevate to authorize a new session.",
             status.map_or_else(|| "unknown status".into(), |status| status.to_string()),
             diagnostic.trim()
         ))
@@ -517,6 +519,7 @@ printf 'closed\n' > "$base/closed"
         assert!(
             matches!(wait_for(|| authorization.try_recv().ok()), Authorization::Failed(error) if error.contains("cancelled"))
         );
+        assert!(session.is_closed(), "failure must immediately allow retry");
         assert!(
             session
                 .start(
@@ -566,6 +569,7 @@ printf 'closed\n' > "$base/closed"
             wait_for(|| authorization.try_recv().ok()),
             Authorization::Failed(_)
         ));
+        assert!(session.is_closed(), "failure must immediately allow retry");
         assert!(
             session
                 .start(

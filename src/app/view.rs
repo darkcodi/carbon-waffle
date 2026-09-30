@@ -22,6 +22,7 @@ impl App {
         .spacing(5);
 
         let screen = match self.page {
+            Page::Elevate => self.elevate(),
             Page::Monitoring => self.monitoring(),
             Page::Discover => self.discover(),
             Page::Capture => self.capture(),
@@ -163,7 +164,121 @@ impl App {
                 .style(style::quiet),
             );
         }
-        container(steps).max_width(760).width(Fill).into()
+        container(steps).max_width(820).width(Fill).into()
+    }
+
+    fn elevate(&self) -> Element<'_, Message> {
+        let ready = self.authorization == Authorization::Ready;
+        let (label, hint) = match &self.authorization {
+            Authorization::Idle => (
+                "Elevate permissions",
+                "Authorize once. Permissions last until you close the app.",
+            ),
+            Authorization::Pending => (
+                "Waiting for authorization…",
+                "Complete the authorization prompt on your desktop.",
+            ),
+            Authorization::Ready if self.demo => (
+                "Demo permissions enabled",
+                "Demo mode simulates commands and needs no authorization.",
+            ),
+            Authorization::Ready => (
+                "Permissions elevated",
+                "You're authorized for the rest of this session.",
+            ),
+            Authorization::Failed(error) => ("Elevate permissions", error.as_str()),
+        };
+        let permissions = column![
+            button(
+                text(label)
+                    .size(14)
+                    .font(style::SEMIBOLD)
+                    .align_x(Center)
+                    .width(Fill)
+            )
+            .on_press_maybe(
+                (matches!(
+                    self.authorization,
+                    Authorization::Idle | Authorization::Failed(_)
+                ) && !self.closing
+                    && self.jobs.is_empty())
+                .then_some(Message::Elevate)
+            )
+            .padding([14, 20])
+            .width(Fill)
+            .style(style::primary),
+            text(hint).size(12).align_x(Center).width(Fill).color(
+                if matches!(self.authorization, Authorization::Failed(_)) {
+                    style::ERROR
+                } else if ready {
+                    style::ACCENT
+                } else {
+                    style::MUTED
+                }
+            ),
+        ]
+        .spacing(12);
+        let mut dependencies = column![disclosure(
+            "Required dependencies",
+            self.panels.dependencies,
+            Panel::Dependencies,
+        )]
+        .spacing(12)
+        .width(Fill);
+        if self.panels.dependencies {
+            dependencies = dependencies.push(
+                row![
+                    widget::space().width(Fill),
+                    button(text("Refresh").size(12))
+                        .on_press_maybe(
+                            (!self.radio_busy() && !self.closing).then_some(Message::Refresh),
+                        )
+                        .style(style::quiet)
+                        .padding(0),
+                ]
+                .align_y(Center)
+                .width(Fill),
+            );
+            let tools = self
+                .tools
+                .iter()
+                .fold(column![].spacing(10), |list, (tool, present)| {
+                    list.push(
+                        row![
+                            text(tool.name()).font(Font::MONOSPACE).size(12).width(Fill),
+                            text(if *present {
+                                "Available"
+                            } else {
+                                "Not installed"
+                            })
+                            .size(12)
+                            .color(if *present {
+                                style::ACCENT
+                            } else {
+                                style::MUTED
+                            }),
+                        ]
+                        .align_y(Center),
+                    )
+                });
+            dependencies =
+                dependencies.push(container(tools).padding(20).width(Fill).style(style::card));
+        }
+        container(
+            column![
+                heading(
+                    "Elevate permissions.",
+                    "Get your session ready before working with your adapter."
+                ),
+                permissions,
+                dependencies,
+            ]
+            .spacing(24)
+            .width(Fill),
+        )
+        .width(Fill)
+        .max_width(490)
+        .into()
     }
 
     fn monitoring(&self) -> Element<'_, Message> {
@@ -260,32 +375,6 @@ impl App {
                 )
                 .width(Fill),
             );
-        }
-        content = content.push(disclosure("Prerequisites", self.panels.tools, Panel::Tools));
-        if self.panels.tools {
-            let tools = self
-                .tools
-                .iter()
-                .fold(column![].spacing(10), |list, (tool, present)| {
-                    list.push(
-                        row![
-                            text(tool.name()).font(Font::MONOSPACE).size(12).width(Fill),
-                            text(if *present {
-                                "Available"
-                            } else {
-                                "Not installed"
-                            })
-                            .size(12)
-                            .color(if *present {
-                                style::ACCENT
-                            } else {
-                                style::MUTED
-                            }),
-                        ]
-                        .align_y(Center),
-                    )
-                });
-            content = content.push(container(tools).padding(20).width(Fill).style(style::card));
         }
         container(content).width(Fill).max_width(490).into()
     }
@@ -744,7 +833,7 @@ impl App {
         {
             content = content.push(
                 text(format!(
-                    "{} isn't installed. Add it to PATH, then refresh tools in Monitoring.",
+                    "{} isn't installed. Add it to PATH, then refresh Required dependencies in Elevate.",
                     required_tool.name()
                 ))
                 .size(12)

@@ -21,6 +21,7 @@ mod performance;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
+    Elevate,
     Monitoring,
     Discover,
     Capture,
@@ -28,7 +29,8 @@ pub enum Page {
 }
 
 impl Page {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
+        Self::Elevate,
         Self::Monitoring,
         Self::Discover,
         Self::Capture,
@@ -37,6 +39,7 @@ impl Page {
 
     fn label(self) -> &'static str {
         match self {
+            Self::Elevate => "Elevate",
             Self::Monitoring => "Monitoring",
             Self::Discover => "Discover",
             Self::Capture => "Capture",
@@ -48,7 +51,7 @@ impl Page {
 #[derive(Debug, Clone, Copy)]
 pub enum Panel {
     Activity,
-    Tools,
+    Dependencies,
     Reconnect,
     CaptureFile,
     Conversion,
@@ -58,7 +61,7 @@ pub enum Panel {
 #[derive(Default)]
 struct Panels {
     activity: bool,
-    tools: bool,
+    dependencies: bool,
     reconnect: bool,
     capture_file: bool,
     conversion: bool,
@@ -80,6 +83,7 @@ pub enum Action {
 #[derive(Debug, Clone)]
 pub enum Message {
     Tick,
+    Elevate,
     Authorization(Authorization),
     Page(Page),
     Interface(Interface),
@@ -176,7 +180,7 @@ impl App {
             .join("captures")
             .join(format!("session-{stamp}-{}", std::process::id()));
         let mut app = Self {
-            page: Page::Monitoring,
+            page: Page::Elevate,
             demo,
             interfaces: vec![],
             interface: None,
@@ -195,11 +199,11 @@ impl App {
                 .into_iter()
                 .map(|tool| (tool, find_tool(tool.name()).is_some()))
                 .collect(),
-            runner: Runner::new(demo),
+            runner: Runner::new(),
             authorization: if demo {
                 Authorization::Ready
             } else {
-                Authorization::Pending
+                Authorization::Idle
             },
             jobs: vec![],
             pending: None,
@@ -207,7 +211,7 @@ impl App {
             session,
             activity: vec![],
             copied_activity: None,
-            status: "Authorize this session in the desktop prompt…".into(),
+            status: "Elevate permissions to begin.".into(),
             status_error: false,
             panels: Panels::default(),
             closing: false,
@@ -675,10 +679,34 @@ impl App {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::Elevate => {
+                if self.closing
+                    || !self.jobs.is_empty()
+                    || matches!(
+                        self.authorization,
+                        Authorization::Pending | Authorization::Ready
+                    )
+                {
+                    return Task::none();
+                }
+                if self.demo {
+                    return self.update(Message::Authorization(Authorization::Ready));
+                }
+                match self.runner.authorize() {
+                    Ok(()) => {
+                        self.authorization = Authorization::Pending;
+                        self.status = "Authorize this session in the desktop prompt…".into();
+                        self.status_error = false;
+                    }
+                    Err(error) => {
+                        return self.update(Message::Authorization(Authorization::Failed(error)));
+                    }
+                }
+            }
             Message::Authorization(authorization) => {
                 match &authorization {
                     Authorization::Ready if !self.closing => {
-                        self.status = "Ready when you are.".into();
+                        self.status = "Permissions ready for this session.".into();
                         self.status_error = false;
                     }
                     Authorization::Failed(error) if !self.closing => self.fail(error.clone()),
@@ -802,7 +830,7 @@ impl App {
             Message::Toggle(panel) => {
                 let open = match panel {
                     Panel::Activity => &mut self.panels.activity,
-                    Panel::Tools => &mut self.panels.tools,
+                    Panel::Dependencies => &mut self.panels.dependencies,
                     Panel::Reconnect => &mut self.panels.reconnect,
                     Panel::CaptureFile => &mut self.panels.capture_file,
                     Panel::Conversion => &mut self.panels.conversion,
@@ -897,7 +925,49 @@ mod tests {
     }
 
     #[test]
-    fn tools_wait_for_startup_authorization_and_stop_accepting_jobs_on_failure() {
+    fn live_startup_waits_for_explicit_elevation() {
+        let mut app = App::new(false);
+        assert_eq!(app.page, Page::Elevate);
+        assert_eq!(Page::ALL[0], Page::Elevate);
+        assert_eq!(app.authorization, Authorization::Idle);
+        let _ = app.update(Message::Refresh);
+        let _ = app.update(Message::Page(Page::Monitoring));
+        app.run(Action::Monitor);
+        assert!(app.jobs.is_empty());
+        assert!(app.activity.is_empty());
+        assert_eq!(app.authorization, Authorization::Idle);
+        assert_eq!(app.subscription().units(), 1);
+        assert!(matches!(
+            app.runner.authorization.as_mut().unwrap().try_recv(),
+            Err(iced::futures::channel::mpsc::TryRecvError::Empty)
+        ));
+        assert!(app.runner.shutdown());
+    }
+
+    #[test]
+    fn elevation_ignores_duplicate_clicks_and_can_retry_failure() {
+        let mut app = demo_app();
+        app.authorization = Authorization::Pending;
+        let _ = app.update(Message::Elevate);
+        assert_eq!(app.authorization, Authorization::Pending);
+        let _ = app.update(Message::Authorization(Authorization::Failed(
+            "Authorization was cancelled".into(),
+        )));
+        assert!(app.status_error);
+        // Demo retry follows the same UI transition without invoking polkit.
+        let _ = app.update(Message::Elevate);
+        assert_eq!(app.authorization, Authorization::Ready);
+        assert!(!app.status_error);
+        let _ = app.update(Message::Elevate);
+        assert_eq!(app.authorization, Authorization::Ready);
+        let _ = app.update(Message::Close);
+        app.authorization = Authorization::Idle;
+        let _ = app.update(Message::Elevate);
+        assert_eq!(app.authorization, Authorization::Idle);
+    }
+
+    #[test]
+    fn tools_wait_for_authorization_and_stop_accepting_jobs_on_failure() {
         let mut app = demo_app();
         app.authorization = Authorization::Pending;
         app.run(Action::Scan);

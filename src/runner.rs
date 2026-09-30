@@ -89,30 +89,36 @@ pub struct Runner {
     pub events: Receiver<(u64, Event)>,
     sender: SyncSender<(u64, Event)>,
     session: Option<session::Session>,
+    authorization_updates: iced::futures::channel::mpsc::UnboundedSender<Authorization>,
     pub authorization: Option<iced::futures::channel::mpsc::UnboundedReceiver<Authorization>>,
 }
 
 impl Runner {
-    pub fn new(demo: bool) -> Self {
+    pub fn new() -> Self {
         let (sender, events) = mpsc::sync_channel(512);
         let (updates, authorization) = iced::futures::channel::mpsc::unbounded();
-        let session = if demo {
-            None
-        } else {
-            match session::Session::new(sender.clone(), updates.clone()) {
-                Ok(session) => Some(session),
-                Err(error) => {
-                    let _ = updates.unbounded_send(Authorization::Failed(error));
-                    None
-                }
-            }
-        };
         Self {
             events,
             sender,
-            session,
+            session: None,
+            authorization_updates: updates,
             authorization: Some(authorization),
         }
+    }
+
+    pub fn authorize(&mut self) -> Result<(), String> {
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| !session.is_closed())
+        {
+            return Err("Session authorization is already active.".into());
+        }
+        self.session = Some(session::Session::new(
+            self.sender.clone(),
+            self.authorization_updates.clone(),
+        )?);
+        Ok(())
     }
 
     pub fn start(&self, id: u64, operation: Operation, demo: bool) -> Result<Job, String> {
@@ -165,9 +171,7 @@ impl Runner {
             if spec.privileged {
                 self.session
                     .as_ref()
-                    .ok_or(
-                        "The privileged session is unavailable. Restart the app to authorize it.",
-                    )?
+                    .ok_or("The privileged session is unavailable. Open Elevate to authorize it.")?
                     .start(id, request, flag)?;
             } else {
                 let helper = std::env::current_exe().map_err(|e| e.to_string())?;

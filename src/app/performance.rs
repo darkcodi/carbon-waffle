@@ -38,9 +38,9 @@ fn populated_app() -> App {
 #[ignore = "manual rendering benchmark; reports timings instead of hardware-dependent thresholds"]
 fn scroll_rendering() {
     let mut app = populated_app();
-    for page in [Page::Monitoring, Page::Discover] {
+    app.panels.dependencies = true;
+    for page in [Page::Elevate, Page::Discover] {
         app.page = page;
-        app.panels.tools = true;
         let size = Size::new(900.0, 680.0);
         let viewport = Viewport::with_physical_size(Size::new(900, 680), 1.0);
         let mut renderer = iced_tiny_skia::Renderer::new(Font::DEFAULT, 16.0.into());
