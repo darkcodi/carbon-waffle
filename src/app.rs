@@ -53,8 +53,33 @@ pub enum Message {
     Run(Action),
     Stop(u64),
     StopAll,
-    ClearLog,
+    ClearActivity,
+    CopyActivity(u64),
     Close,
+}
+
+struct CommandActivity {
+    id: u64,
+    label: &'static str,
+    command: String,
+    output: VecDeque<String>,
+    outcome: String,
+}
+
+impl CommandActivity {
+    fn push(&mut self, line: String) {
+        self.output.push_back(line);
+        while self.output.len() > 400 {
+            self.output.pop_front();
+        }
+    }
+
+    fn transcript(&self) -> String {
+        std::iter::once(format!("$ {}", self.command))
+            .chain(self.output.iter().cloned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 pub struct App {
@@ -78,9 +103,9 @@ pub struct App {
     pending: Option<Operation>,
     next_id: u64,
     session: PathBuf,
-    log: VecDeque<String>,
+    activity: Vec<CommandActivity>,
+    copied_activity: Option<u64>,
     status: String,
-    preview: String,
     closing: bool,
 }
 
@@ -119,9 +144,9 @@ impl App {
             pending: None,
             next_id: 0,
             session,
-            log: VecDeque::new(),
+            activity: vec![],
+            copied_activity: None,
             status: "Choose an adapter, enable monitor mode, then start discovery.".into(),
-            preview: "Commands appear here when a job starts.".into(),
             closing: false,
         };
         app.refresh();
@@ -180,10 +205,12 @@ impl App {
         self.status = "Demo mode · all jobs are simulated; no radio operations run.".into();
     }
 
-    fn log(&mut self, line: String) {
-        self.log.push_back(line);
-        while self.log.len() > 400 {
-            self.log.pop_front();
+    fn log(&mut self, id: u64, line: String) {
+        if let Some(activity) = self.activity.iter_mut().find(|activity| activity.id == id) {
+            activity.push(line);
+            if self.copied_activity == Some(id) {
+                self.copied_activity = None;
+            }
         }
     }
 
@@ -209,28 +236,43 @@ impl App {
     }
 
     fn launch(&mut self, operation: Operation) {
+        let spec = match operation.spec() {
+            Ok(spec) => spec,
+            Err(error) => {
+                self.fail(error);
+                return;
+            }
+        };
+        self.next_id += 1;
+        self.activity.push(CommandActivity {
+            id: self.next_id,
+            label: operation.label(),
+            command: spec.preview(),
+            output: VecDeque::new(),
+            outcome: String::new(),
+        });
         if !self.demo {
             let mut builder = fs::DirBuilder::new();
             builder.recursive(true).mode(0o700);
             if let Err(error) = builder.create(&self.session) {
-                self.fail(format!("Cannot create session directory: {error}"));
+                self.command_failed(
+                    self.next_id,
+                    format!("Cannot create session directory: {error}"),
+                );
                 return;
             }
         }
-        self.next_id += 1;
         match self
             .runner
             .start(self.next_id, operation.clone(), self.demo)
         {
             Ok(job) => {
-                self.preview = operation.spec().unwrap().preview();
-                self.log(format!("[{}] $ {}", job.id, self.preview));
                 self.status = format!(
                     "{}{}",
                     operation.label(),
                     if self.demo {
                         " · simulated"
-                    } else if operation.spec().unwrap().privileged {
+                    } else if spec.privileged {
                         " · waiting for worker / desktop authorization"
                     } else {
                         " · starting"
@@ -242,12 +284,19 @@ impl App {
                 }
                 self.jobs.push(job);
             }
-            Err(error) => self.fail(error),
+            Err(error) => self.command_failed(self.next_id, error),
         }
     }
 
+    fn command_failed(&mut self, id: u64, error: String) {
+        if let Some(activity) = self.activity.iter_mut().find(|activity| activity.id == id) {
+            activity.outcome = "Failed".into();
+        }
+        self.log(id, format!("Error: {error}"));
+        self.fail(error);
+    }
+
     fn fail(&mut self, error: String) {
-        self.log(format!("Error: {error}"));
         self.status = error;
         self.closing = false;
     }
@@ -444,7 +493,15 @@ impl App {
                 )
             }
         );
-        self.log(format!("[{id}] {}", self.status));
+        if let Some(activity) = self.activity.iter_mut().find(|activity| activity.id == id) {
+            activity.outcome = if cancelled {
+                "Stopped".into()
+            } else if ok {
+                "Finished".into()
+            } else {
+                code.map_or("Failed".into(), |code| format!("Exit {code}"))
+            };
+        }
         match &job.operation {
             Operation::Monitor { enable, interface } => {
                 let old_phy = self
@@ -511,7 +568,9 @@ impl App {
         }
         if let Some(error) = error {
             self.pending = None;
-            self.fail(error);
+            self.command_failed(id, error);
+        } else {
+            self.log(id, self.status.clone());
         }
     }
 
@@ -526,7 +585,7 @@ impl App {
                                 job.started = true;
                             }
                         }
-                        Event::Line(line) => self.log(format!("[{id}] {line}")),
+                        Event::Line(line) => self.log(id, line),
                         Event::Survey(survey) => {
                             if self.jobs.iter().any(|j| {
                                 j.id == id && matches!(j.operation, Operation::Scan { .. })
@@ -581,7 +640,8 @@ impl App {
                     self.wordlist.clear();
                     self.station.clear();
                     self.pending = None;
-                    self.log.clear();
+                    self.activity.clear();
+                    self.copied_activity = None;
                     self.refresh();
                     if self.demo {
                         self.load_demo();
@@ -629,7 +689,17 @@ impl App {
                     job.stop();
                 }
             }
-            Message::ClearLog => self.log.clear(),
+            Message::ClearActivity => {
+                self.activity
+                    .retain(|activity| self.jobs.iter().any(|job| job.id == activity.id));
+                self.copied_activity = None;
+            }
+            Message::CopyActivity(id) => {
+                if let Some(activity) = self.activity.iter().find(|activity| activity.id == id) {
+                    self.copied_activity = Some(id);
+                    return iced::clipboard::write(activity.transcript());
+                }
+            }
             Message::Close => {
                 self.closing = true;
                 self.pending = None;
@@ -685,35 +755,6 @@ impl App {
             container(column![tabs, content].spacing(16)).width(Fill)
         ]
         .spacing(20);
-        let logs = self
-            .log
-            .iter()
-            .rev()
-            .take(90)
-            .rev()
-            .fold(column![].spacing(2), |col, line| {
-                col.push(text(line).font(Font::MONOSPACE).size(12))
-            });
-        let console = container(
-            column![
-                row![
-                    text("ACTIVITY").size(12),
-                    widget::space().width(Fill),
-                    button("Clear")
-                        .on_press(Message::ClearLog)
-                        .style(button::text)
-                ]
-                .align_y(iced::Center),
-                text(&self.preview)
-                    .font(Font::MONOSPACE)
-                    .size(12)
-                    .style(text::primary),
-                scrollable(logs).anchor_bottom().height(140),
-            ]
-            .spacing(6),
-        )
-        .padding(14)
-        .style(container::rounded_box);
         container(
             column![
                 title,
@@ -727,11 +768,130 @@ impl App {
                     .padding(10)
                     .width(Fill)
                     .style(container::rounded_box),
-                console,
+                self.activity_view(),
             ]
+            .width(Fill)
             .spacing(14),
         )
+        .width(Fill)
         .padding(24)
+        .into()
+    }
+
+    fn activity_view(&self) -> Element<'_, Message> {
+        let heading = row![
+            text("ACTIVITY").size(12),
+            widget::space().width(Fill),
+            button("Clear completed")
+                .on_press_maybe(
+                    self.activity
+                        .iter()
+                        .any(|activity| !self.jobs.iter().any(|job| job.id == activity.id))
+                        .then_some(Message::ClearActivity)
+                )
+                .style(button::text),
+        ]
+        .width(Fill)
+        .align_y(iced::Center);
+
+        let panels: Element<'_, Message> = if self.activity.is_empty() {
+            container(
+                text("Command output will appear here, one panel per command.")
+                    .size(13)
+                    .style(text::secondary),
+            )
+            .padding(16)
+            .width(Fill)
+            .style(container::rounded_box)
+            .into()
+        } else {
+            let entries = widget::keyed_column(
+                self.activity
+                    .iter()
+                    .rev()
+                    .map(|activity| (activity.id, self.command_panel(activity))),
+            )
+            .width(Fill)
+            .spacing(10)
+            .padding(iced::Padding {
+                right: 14.0,
+                ..Default::default()
+            });
+
+            scrollable(entries)
+                .id("activity-history")
+                .width(Fill)
+                .height(if self.activity.len() == 1 { 230 } else { 320 })
+                .into()
+        };
+
+        column![heading, panels].width(Fill).spacing(6).into()
+    }
+
+    fn command_panel<'a>(&'a self, activity: &'a CommandActivity) -> Element<'a, Message> {
+        let state = self.jobs.iter().find(|job| job.id == activity.id).map_or(
+            activity.outcome.as_str(),
+            |job| {
+                if job.stopping {
+                    "Stopping…"
+                } else if job.started {
+                    "Running"
+                } else {
+                    "Starting…"
+                }
+            },
+        );
+        let output = activity
+            .output
+            .iter()
+            .fold(column![].width(Fill).spacing(2), |lines, line| {
+                lines.push(text(line).font(Font::MONOSPACE).size(12).width(Fill))
+            });
+        container(
+            column![
+                row![
+                    text(format!("{}  ·  {}", activity.id, activity.label))
+                        .size(13)
+                        .width(Fill),
+                    text(state).size(12).style(text::secondary),
+                    button(if self.copied_activity == Some(activity.id) {
+                        "Copied!"
+                    } else {
+                        "Copy"
+                    })
+                    .on_press(Message::CopyActivity(activity.id))
+                    .style(button::secondary),
+                ]
+                .width(Fill)
+                .spacing(12)
+                .align_y(iced::Center),
+                scrollable(
+                    column![
+                        text(format!("$ {}", activity.command))
+                            .font(Font::MONOSPACE)
+                            .size(12)
+                            .style(text::primary)
+                            .width(Fill),
+                        output,
+                    ]
+                    .width(Fill)
+                    .spacing(8)
+                    .padding(iced::Padding {
+                        right: 14.0,
+                        ..Default::default()
+                    })
+                )
+                .id(format!("command-output-{}", activity.id))
+                .anchor_bottom()
+                .width(Fill)
+                .height(156),
+            ]
+            .width(Fill)
+            .spacing(10),
+        )
+        .padding(14)
+        .width(Fill)
+        .style(container::rounded_box)
         .into()
     }
 
