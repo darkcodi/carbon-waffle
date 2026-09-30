@@ -16,8 +16,8 @@ fn main() -> iced::Result {
         .theme(app::App::theme)
         .subscription(app::App::subscription)
         .window(iced::window::Settings {
-            size: iced::Size::new(1280.0, 900.0),
-            min_size: Some(iced::Size::new(1000.0, 720.0)),
+            size: iced::Size::new(1120.0, 850.0),
+            min_size: Some(iced::Size::new(900.0, 680.0)),
             exit_on_close_request: false,
             ..Default::default()
         })

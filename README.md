@@ -17,9 +17,11 @@ Demo mode uses synthetic networks and simulated jobs. It never executes the wire
 - `pkexec` (polkit) and a running desktop polkit authentication agent for privileged radio operations.
 - An adapter/driver supporting monitor mode; injection support for deauthentication.
 
-The toolchain panel reports detected executables. On NixOS, `nix-shell` provides build and GUI runtime libraries, plus the external tools. Desktop polkit configuration still comes from your system.
+The **Adapter & tool details** section in Monitoring reports detected executables. On NixOS, `nix-shell` provides build and GUI runtime libraries, plus the external tools. Desktop polkit configuration still comes from your system.
 
 ## Workflow
+
+The four steps at the top are **Monitoring → Discover → Capture → Recover**. Select any step to revisit it; changing steps does not run a command. Each screen contains the controls for that step, with additional options tucked into expandable sections.
 
 1. Select the research adapter, check interfering processes, and enable monitor mode. The application rediscovers interfaces by PHY after `airmon-ng` runs, rather than assuming a `mon` suffix.
 2. Start discovery and select a network. The network list shows signal, channel, authentication, and associated clients; it updates from airodump's CSV files.
@@ -29,13 +31,16 @@ The toolchain panel reports detected executables. On NixOS, `nix-shell` provides
 6. Choose a wordlist and run Aircrack-ng, or convert to `.hc22000` and run Hashcat. You can enter existing capture/hash paths, too. Aircrack-ng inspection and recovery use the network selected in Discover; Hashcat processes every record in its input file.
 7. Restore managed mode when finished. Normal window closure stops jobs and attempts to restore the monitor interface this session enabled. Interfaces already in monitor mode before launch are left under your control.
 
+Open **Activity** at the bottom to inspect command output. Every command retains its own full-width panel, independent scrollbar, and top-right **Copy** button for its command and output. Active jobs can be stopped from their screen or Activity; **Stop all** remains available while any job is running. Failed commands and capture inspection open Activity automatically.
+
 Capture and recovery files are retained under `captures/session-…/`, with private session directories. Capture files created by elevated tools may be root-owned. Recovered secrets may appear in CLI output and result files. Nothing is uploaded. Hashcat uses a session-local potfile; the GUI reports its exit status and result path rather than interpreting all progress/result formats.
 
 Monitor mode may disconnect the chosen adapter. The app reports conflicting processes but does not run `airmon-ng check kill` or restart system networking services. A separate research adapter is useful when you need to keep a network connection.
 
 ## Implementation
 
-- `src/app.rs`: iced UI, workflow state, adapter ownership, and job coordination.
+- `src/app.rs`: workflow state, adapter ownership, and job coordination.
+- `src/app/view.rs` and `src/app/appearance.rs`: step-based screens and shared visual styles.
 - `src/model.rs`: sysfs adapter discovery, airodump CSV parsing, and input validation.
 - `src/command.rs`: typed operations and argument builders. Commands use `Command::args`, never a shell; absolute paths keep file names from becoming options.
 - `src/runner.rs`: worker IPC, concurrent output readers, snapshot delivery, and process-group cancellation.

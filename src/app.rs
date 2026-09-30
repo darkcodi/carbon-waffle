@@ -3,10 +3,7 @@ use crate::{
     model::{self, Interface, Network, Survey, absolute_path},
     runner::{Event, Job, Runner},
 };
-use iced::{
-    Element, Fill, Font, Subscription, Task, Theme,
-    widget::{self, button, column, container, pick_list, row, scrollable, text, text_input},
-};
+use iced::{Subscription, Task};
 use std::{
     collections::VecDeque,
     fs,
@@ -15,11 +12,53 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+mod appearance;
+mod view;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
+    Monitoring,
     Discover,
     Capture,
     Recover,
+}
+
+impl Page {
+    const ALL: [Self; 4] = [
+        Self::Monitoring,
+        Self::Discover,
+        Self::Capture,
+        Self::Recover,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Monitoring => "Monitoring",
+            Self::Discover => "Discover",
+            Self::Capture => "Capture",
+            Self::Recover => "Recover",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Panel {
+    Activity,
+    Tools,
+    Reconnect,
+    CaptureFile,
+    Conversion,
+    Session,
+}
+
+#[derive(Default)]
+struct Panels {
+    activity: bool,
+    tools: bool,
+    reconnect: bool,
+    capture_file: bool,
+    conversion: bool,
+    session: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -55,6 +94,7 @@ pub enum Message {
     StopAll,
     ClearActivity,
     CopyActivity(u64),
+    Toggle(Panel),
     Close,
 }
 
@@ -106,6 +146,8 @@ pub struct App {
     activity: Vec<CommandActivity>,
     copied_activity: Option<u64>,
     status: String,
+    status_error: bool,
+    panels: Panels,
     closing: bool,
 }
 
@@ -121,7 +163,7 @@ impl App {
             .join("captures")
             .join(format!("session-{stamp}-{}", std::process::id()));
         let mut app = Self {
-            page: Page::Discover,
+            page: Page::Monitoring,
             demo,
             interfaces: vec![],
             interface: None,
@@ -146,7 +188,9 @@ impl App {
             session,
             activity: vec![],
             copied_activity: None,
-            status: "Choose an adapter, enable monitor mode, then start discovery.".into(),
+            status: "Ready when you are.".into(),
+            status_error: false,
+            panels: Panels::default(),
             closing: false,
         };
         app.refresh();
@@ -154,10 +198,6 @@ impl App {
             app.load_demo();
         }
         app
-    }
-
-    pub fn theme(&self) -> Theme {
-        Theme::TokyoNight
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
@@ -267,6 +307,10 @@ impl App {
             .start(self.next_id, operation.clone(), self.demo)
         {
             Ok(job) => {
+                self.status_error = false;
+                if matches!(operation, Operation::Inspect { .. }) {
+                    self.panels.activity = true;
+                }
                 self.status = format!(
                     "{}{}",
                     operation.label(),
@@ -289,6 +333,7 @@ impl App {
     }
 
     fn command_failed(&mut self, id: u64, error: String) {
+        self.panels.activity = true;
         if let Some(activity) = self.activity.iter_mut().find(|activity| activity.id == id) {
             activity.outcome = "Failed".into();
         }
@@ -297,6 +342,7 @@ impl App {
     }
 
     fn fail(&mut self, error: String) {
+        self.status_error = true;
         self.status = error;
         self.closing = false;
     }
@@ -479,6 +525,10 @@ impl App {
         };
         let job = self.jobs.remove(index);
         let ok = code == Some(0) && error.is_none() && !cancelled;
+        self.status_error = !ok && !cancelled;
+        if self.status_error {
+            self.panels.activity = true;
+        }
         self.status = format!(
             "{} · {}",
             job.operation.label(),
@@ -617,7 +667,13 @@ impl App {
                     }
                 }
             }
-            Message::Page(page) => self.page = page,
+            Message::Page(page) => {
+                self.page = page;
+                return iced::widget::operation::scroll_to(
+                    "current-step",
+                    iced::widget::operation::AbsoluteOffset { x: 0.0, y: 0.0 },
+                );
+            }
             Message::Interface(interface) => {
                 if !self.radio_busy() {
                     self.interface = Some(interface);
@@ -631,6 +687,9 @@ impl App {
             Message::Demo => {
                 if self.jobs.is_empty() && self.owned_monitor.is_none() {
                     self.demo = !self.demo;
+                    self.page = Page::Monitoring;
+                    self.panels = Panels::default();
+                    self.status_error = false;
                     self.interfaces.clear();
                     self.interface = None;
                     self.survey = Survey::default();
@@ -700,6 +759,17 @@ impl App {
                     return iced::clipboard::write(activity.transcript());
                 }
             }
+            Message::Toggle(panel) => {
+                let open = match panel {
+                    Panel::Activity => &mut self.panels.activity,
+                    Panel::Tools => &mut self.panels.tools,
+                    Panel::Reconnect => &mut self.panels.reconnect,
+                    Panel::CaptureFile => &mut self.panels.capture_file,
+                    Panel::Conversion => &mut self.panels.conversion,
+                    Panel::Session => &mut self.panels.session,
+                };
+                *open = !*open;
+            }
             Message::Close => {
                 self.closing = true;
                 self.pending = None;
@@ -710,495 +780,6 @@ impl App {
             }
         }
         Task::none()
-    }
-
-    pub fn view(&self) -> Element<'_, Message> {
-        let title = row![
-            column![
-                text("CARBON WAFFLE").size(26),
-                text("Wireless research workbench")
-                    .size(13)
-                    .style(text::secondary)
-            ]
-            .spacing(4),
-            widget::space().width(Fill),
-            button("Stop all jobs")
-                .on_press_maybe((!self.jobs.is_empty()).then_some(Message::StopAll))
-                .style(button::danger),
-            button(if self.demo {
-                "DEMO MODE  ·  switch to live"
-            } else {
-                "LIVE MODE  ·  try demo"
-            })
-            .on_press_maybe(
-                (self.jobs.is_empty() && self.owned_monitor.is_none() && !self.closing)
-                    .then_some(Message::Demo)
-            )
-            .style(button::secondary),
-        ]
-        .spacing(12)
-        .align_y(iced::Center);
-
-        let tabs = row![
-            self.tab("01  Discover", Page::Discover),
-            self.tab("02  Capture", Page::Capture),
-            self.tab("03  Recover", Page::Recover)
-        ]
-        .spacing(8);
-        let content = match self.page {
-            Page::Discover => self.discover(),
-            Page::Capture => self.capture(),
-            Page::Recover => self.recover(),
-        };
-        let body = row![
-            self.sidebar(),
-            container(column![tabs, content].spacing(16)).width(Fill)
-        ]
-        .spacing(20);
-        container(
-            column![
-                title,
-                widget::rule::horizontal(1),
-                scrollable(container(body).padding(iced::Padding {
-                    right: 14.0,
-                    ..Default::default()
-                }))
-                .height(Fill),
-                container(text(&self.status).size(13))
-                    .padding(10)
-                    .width(Fill)
-                    .style(container::rounded_box),
-                self.activity_view(),
-            ]
-            .width(Fill)
-            .spacing(14),
-        )
-        .width(Fill)
-        .padding(24)
-        .into()
-    }
-
-    fn activity_view(&self) -> Element<'_, Message> {
-        let heading = row![
-            text("ACTIVITY").size(12),
-            widget::space().width(Fill),
-            button("Clear completed")
-                .on_press_maybe(
-                    self.activity
-                        .iter()
-                        .any(|activity| !self.jobs.iter().any(|job| job.id == activity.id))
-                        .then_some(Message::ClearActivity)
-                )
-                .style(button::text),
-        ]
-        .width(Fill)
-        .align_y(iced::Center);
-
-        let panels: Element<'_, Message> = if self.activity.is_empty() {
-            container(
-                text("Command output will appear here, one panel per command.")
-                    .size(13)
-                    .style(text::secondary),
-            )
-            .padding(16)
-            .width(Fill)
-            .style(container::rounded_box)
-            .into()
-        } else {
-            let entries = widget::keyed_column(
-                self.activity
-                    .iter()
-                    .rev()
-                    .map(|activity| (activity.id, self.command_panel(activity))),
-            )
-            .width(Fill)
-            .spacing(10)
-            .padding(iced::Padding {
-                right: 14.0,
-                ..Default::default()
-            });
-
-            scrollable(entries)
-                .id("activity-history")
-                .width(Fill)
-                .height(if self.activity.len() == 1 { 230 } else { 320 })
-                .into()
-        };
-
-        column![heading, panels].width(Fill).spacing(6).into()
-    }
-
-    fn command_panel<'a>(&'a self, activity: &'a CommandActivity) -> Element<'a, Message> {
-        let state = self.jobs.iter().find(|job| job.id == activity.id).map_or(
-            activity.outcome.as_str(),
-            |job| {
-                if job.stopping {
-                    "Stopping…"
-                } else if job.started {
-                    "Running"
-                } else {
-                    "Starting…"
-                }
-            },
-        );
-        let output = activity
-            .output
-            .iter()
-            .fold(column![].width(Fill).spacing(2), |lines, line| {
-                lines.push(text(line).font(Font::MONOSPACE).size(12).width(Fill))
-            });
-        container(
-            column![
-                row![
-                    text(format!("{}  ·  {}", activity.id, activity.label))
-                        .size(13)
-                        .width(Fill),
-                    text(state).size(12).style(text::secondary),
-                    button(if self.copied_activity == Some(activity.id) {
-                        "Copied!"
-                    } else {
-                        "Copy"
-                    })
-                    .on_press(Message::CopyActivity(activity.id))
-                    .style(button::secondary),
-                ]
-                .width(Fill)
-                .spacing(12)
-                .align_y(iced::Center),
-                scrollable(
-                    column![
-                        text(format!("$ {}", activity.command))
-                            .font(Font::MONOSPACE)
-                            .size(12)
-                            .style(text::primary)
-                            .width(Fill),
-                        output,
-                    ]
-                    .width(Fill)
-                    .spacing(8)
-                    .padding(iced::Padding {
-                        right: 14.0,
-                        ..Default::default()
-                    })
-                )
-                .id(format!("command-output-{}", activity.id))
-                .anchor_bottom()
-                .width(Fill)
-                .height(156),
-            ]
-            .width(Fill)
-            .spacing(10),
-        )
-        .padding(14)
-        .width(Fill)
-        .style(container::rounded_box)
-        .into()
-    }
-
-    fn tab<'a>(&self, label: &'a str, page: Page) -> Element<'a, Message> {
-        button(text(label).size(14))
-            .padding([10, 18])
-            .on_press(Message::Page(page))
-            .style(if self.page == page {
-                button::primary
-            } else {
-                button::secondary
-            })
-            .into()
-    }
-
-    fn action(&self, label: &'static str, action: Action, enabled: bool) -> Element<'_, Message> {
-        button(label)
-            .padding([9, 12])
-            .on_press_maybe(
-                (enabled && !self.closing && self.pending.is_none())
-                    .then_some(Message::Run(action)),
-            )
-            .into()
-    }
-
-    fn sidebar(&self) -> Element<'_, Message> {
-        let idle = !self.radio_busy();
-        let monitor = self.interface.as_ref().is_some_and(|i| i.monitor);
-        let mut adapters = pick_list(
-            self.interfaces.clone(),
-            self.interface.clone(),
-            Message::Interface,
-        )
-        .placeholder("No wireless adapter")
-        .width(Fill);
-        if !idle {
-            adapters = pick_list(self.interfaces.clone(), self.interface.clone(), |_| {
-                Message::Tick
-            })
-            .width(Fill);
-        }
-        let tools = self
-            .tools
-            .iter()
-            .fold(column![].spacing(5), |col, (tool, exists)| {
-                col.push(
-                    row![
-                        text(if *exists { "●" } else { "○" }).style(if *exists {
-                            text::success
-                        } else {
-                            text::secondary
-                        }),
-                        text(tool.name()).size(12)
-                    ]
-                    .spacing(8),
-                )
-            });
-        let mut jobs = column![].spacing(6);
-        for job in &self.jobs {
-            jobs = jobs.push(
-                row![
-                    text(format!(
-                        "{}\n{}",
-                        job.operation.label(),
-                        if job.stopping {
-                            "Stopping…"
-                        } else if job.started {
-                            "Running"
-                        } else {
-                            "Starting…"
-                        }
-                    ))
-                    .size(12)
-                    .width(Fill),
-                    button("Stop")
-                        .on_press_maybe((!job.stopping).then_some(Message::Stop(job.id)))
-                        .style(button::danger),
-                ]
-                .align_y(iced::Center)
-                .spacing(6),
-            );
-        }
-        container(
-            column![
-                text("ADAPTER").size(12).style(text::secondary),
-                adapters,
-                button("Refresh adapters & tools")
-                    .on_press_maybe(idle.then_some(Message::Refresh))
-                    .style(button::text),
-                self.action(
-                    "Enable monitor mode",
-                    Action::Monitor,
-                    idle && !monitor && self.interface.is_some()
-                ),
-                self.action("Restore managed mode", Action::Restore, idle && monitor),
-                self.action("Check interfering processes", Action::Check, idle),
-                widget::rule::horizontal(1),
-                text("TOOLCHAIN").size(12).style(text::secondary),
-                tools,
-                widget::rule::horizontal(1),
-                text(format!("JOBS  /  {}", self.jobs.len()))
-                    .size(12)
-                    .style(text::secondary),
-                jobs,
-                button("Stop all jobs")
-                    .on_press_maybe((!self.jobs.is_empty()).then_some(Message::StopAll))
-                    .style(button::danger),
-                text(if self.demo {
-                    "Demo data · no tools executed"
-                } else {
-                    "Radio jobs request desktop authorization. Recovery runs as your user."
-                })
-                .size(12)
-                .style(text::secondary),
-            ]
-            .spacing(12),
-        )
-        .width(270)
-        .padding(16)
-        .style(container::rounded_box)
-        .into()
-    }
-
-    fn discover(&self) -> Element<'_, Message> {
-        let mut networks = column![].spacing(6);
-        let filter = self.filter.to_lowercase();
-        let selectable = !self.radio_busy()
-            || self
-                .jobs
-                .iter()
-                .all(|j| !j.operation.radio() || matches!(j.operation, Operation::Scan { .. }));
-        for network in self.survey.networks.iter().filter(|n| {
-            n.ssid.to_lowercase().contains(&filter) || n.bssid.to_lowercase().contains(&filter)
-        }) {
-            let selected = self
-                .target
-                .as_ref()
-                .is_some_and(|n| n.bssid == network.bssid);
-            let clients = self
-                .survey
-                .stations
-                .iter()
-                .filter(|s| s.bssid == network.bssid)
-                .count();
-            networks = networks.push(
-                button(
-                    row![
-                        column![
-                            text(network.label()).size(16),
-                            text(&network.bssid)
-                                .size(12)
-                                .font(Font::MONOSPACE)
-                                .style(text::secondary)
-                        ]
-                        .width(Fill)
-                        .spacing(4),
-                        column![
-                            text(format!("{} · {}", network.security, network.authentication))
-                                .size(12),
-                            text(format!(
-                                "CH {}   {} dBm   {} clients",
-                                network.channel, network.power, clients
-                            ))
-                            .size(12)
-                        ]
-                        .spacing(4),
-                    ]
-                    .align_y(iced::Center)
-                    .spacing(8),
-                )
-                .padding(12)
-                .width(Fill)
-                .style(if selected {
-                    button::primary
-                } else {
-                    button::secondary
-                })
-                .on_press_maybe(selectable.then(|| Message::Select(network.bssid.clone()))),
-            );
-        }
-        if self.survey.networks.is_empty() {
-            networks = networks.push(
-                container(
-                    column![
-                        text("Your next session starts here.").size(22),
-                        text(
-                            "Enable monitor mode and start discovery to see nearby access points."
-                        )
-                        .size(14)
-                        .style(text::secondary)
-                    ]
-                    .spacing(10),
-                )
-                .padding([40, 12]),
-            );
-        }
-        column![
-            text("Discover networks").size(28),
-            text("Scan 2.4 and 5 GHz, inspect clients, and choose a target.")
-                .size(14)
-                .style(text::secondary),
-            row![
-                text_input("Filter by network name or BSSID", &self.filter)
-                    .on_input(Message::Filter),
-                self.action("Start discovery", Action::Scan, !self.radio_busy())
-            ]
-            .spacing(10),
-            text(format!(
-                "{} access points observed",
-                self.survey.networks.len()
-            ))
-            .size(12)
-            .style(text::secondary),
-            networks,
-            row![
-                self.action(
-                    "Capture selected network",
-                    Action::Capture,
-                    self.target.is_some() && selectable
-                ),
-                button("Open capture workspace →")
-                    .on_press(Message::Page(Page::Capture))
-                    .style(button::text)
-            ]
-            .spacing(8),
-        ]
-        .spacing(14)
-        .into()
-    }
-
-    fn target_card(&self) -> Element<'_, Message> {
-        let content = if let Some(target) = &self.target {
-            column![
-                text(target.label()).size(22),
-                text(format!(
-                    "{}  ·  channel {}  ·  {} / {}",
-                    target.bssid, target.channel, target.security, target.authentication
-                ))
-                .size(13)
-                .font(Font::MONOSPACE)
-            ]
-            .spacing(8)
-        } else {
-            column![
-                text("No target selected").size(22),
-                text("Choose a network in Discover.").size(14)
-            ]
-        };
-        container(content)
-            .padding(16)
-            .width(Fill)
-            .style(container::rounded_box)
-            .into()
-    }
-
-    fn capture(&self) -> Element<'_, Message> {
-        let mut clients = row![
-            button("All clients")
-                .on_press(Message::Station(String::new()))
-                .style(button::secondary)
-        ]
-        .spacing(6);
-        if let Some(target) = &self.target {
-            for client in self
-                .survey
-                .stations
-                .iter()
-                .filter(|c| c.bssid == target.bssid)
-            {
-                clients = clients.push(
-                    button(text(&client.mac).size(12))
-                        .on_press(Message::Station(client.mac.clone()))
-                        .style(button::secondary),
-                );
-            }
-        }
-        column![
-            text("Capture a handshake").size(28), self.target_card(),
-            text("Capture locks the adapter to the selected channel. A running discovery job stops first.").size(14).style(text::secondary),
-            self.action("Start target capture", Action::Capture, self.target.is_some() && !self.capture_running()),
-            text("Reconnect clients").size(19),
-            text("A finite deauthentication burst can trigger a new handshake. Blank client MAC addresses all clients of this AP.").size(13).style(text::secondary),
-            clients.wrap(),
-            row![text_input("Client MAC (optional)", &self.station).on_input(Message::Station), text_input("Bursts", &self.count).on_input(Message::Count).width(85), self.action("Send deauth", Action::Deauth, self.capture_running())].spacing(10),
-            text("Capture file").size(13), text_input("/path/to/capture.cap", &self.capture_path).on_input(Message::CapturePath),
-            text("Stop capture to flush packets, then inspect the file. The tool output reports available handshakes; a file alone does not prove one was captured.").size(13).style(text::secondary),
-            row![self.action("Inspect handshake", Action::Inspect, !self.capture_path.is_empty() && !self.radio_busy() && !self.offline_busy()), button("Continue to recovery →").on_press(Message::Page(Page::Recover)).style(button::text)].spacing(10),
-        ].spacing(14).into()
-    }
-
-    fn recover(&self) -> Element<'_, Message> {
-        let idle = !self.offline_busy() && !self.radio_busy();
-        column![
-            text("Recover a WPA/WPA2 PSK").size(28),
-            text("Run a local dictionary against captured authentication data.").size(14).style(text::secondary),
-            pick_list([Engine::Aircrack, Engine::Hashcat], Some(self.engine), Message::Engine),
-            text("Capture file (.cap / .pcap / .pcapng)").size(13),
-            text_input("/path/to/capture.cap", &self.capture_path).on_input(Message::CapturePath),
-            row![self.action("Inspect handshake", Action::Inspect, idle && !self.capture_path.is_empty()), self.action("Convert for Hashcat", Action::Convert, idle && !self.capture_path.is_empty())].spacing(10),
-            text("Hashcat input (.hc22000) · used by the GPU engine").size(13),
-            text_input("Generated by conversion, or enter an existing hash file", &self.hash_path).on_input(Message::HashPath),
-            text("Wordlist").size(13), text_input("/path/to/wordlist.txt", &self.wordlist).on_input(Message::Wordlist),
-            self.action("Start dictionary recovery", Action::Crack, idle && !self.wordlist.is_empty()),
-            text("WPA3-only SAE and enterprise authentication need different workflows. Hashcat processes every record in the supplied hash file.").size(13).style(text::secondary),
-            text("SESSION ARTIFACTS").size(12).style(text::secondary),
-            text(self.session.to_string_lossy().into_owned()).size(12).font(Font::MONOSPACE),
-        ].spacing(12).into()
     }
 }
 
