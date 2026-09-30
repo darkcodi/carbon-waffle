@@ -10,6 +10,7 @@ pkgs.mkShell {
     hcxtools
     hashcat
     iw
+    networkmanager
   ];
 
   LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (with pkgs; [

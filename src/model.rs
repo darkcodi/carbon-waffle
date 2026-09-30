@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::{fmt, fs, path::Path};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Interface {
     pub name: String,
     pub phy: String,

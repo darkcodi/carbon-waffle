@@ -1,6 +1,7 @@
 use crate::{
-    command::{Operation, find_tool},
-    model::{Survey, clean_terminal, parse_survey},
+    command::{CommandSpec, Operation, Tool, find_tool},
+    model::{Interface, Survey, clean_terminal, parse_survey},
+    monitor::{self, NetworkRestore},
 };
 use nix::{
     sys::signal::{Signal, killpg},
@@ -11,7 +12,7 @@ use std::{
     fs,
     io::{self, BufRead, BufReader, Read, Write},
     os::unix::process::CommandExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         Arc,
@@ -27,6 +28,8 @@ pub enum Event {
     Started,
     Line(String),
     Survey(Survey),
+    NetworkRestore(Option<NetworkRestore>),
+    MonitorReady(Interface),
     Finished { code: Option<i32>, cancelled: bool },
     Error(String),
 }
@@ -34,6 +37,8 @@ pub enum Event {
 #[derive(Serialize, Deserialize)]
 struct Request {
     executable: PathBuf,
+    #[serde(default)]
+    nmcli: Option<PathBuf>,
     operation: Operation,
 }
 
@@ -115,6 +120,11 @@ impl Runner {
             };
             let request = Request {
                 executable,
+                nmcli: if matches!(operation, Operation::Monitor { .. }) {
+                    find_tool("nmcli")
+                } else {
+                    None
+                },
                 operation: operation.clone(),
             };
             thread::spawn(move || {
@@ -172,9 +182,14 @@ fn run_helper(
     let tx = sender.clone();
     let saw_finish = Arc::new(AtomicBool::new(false));
     let seen = saw_finish.clone();
+    let worker_started = Arc::new(AtomicBool::new(false));
+    let started = worker_started.clone();
     let reader = thread::spawn(move || {
         for line in BufReader::new(output).lines().map_while(Result::ok) {
             if let Ok(event) = serde_json::from_str::<Event>(&line) {
+                if matches!(event, Event::Started) {
+                    started.store(true, Ordering::Relaxed);
+                }
                 if matches!(event, Event::Finished { .. } | Event::Error(_)) {
                     seen.store(true, Ordering::Relaxed);
                 }
@@ -203,7 +218,9 @@ fn run_helper(
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
             break status;
         }
-        if stopping.is_some_and(|at| at.elapsed() > Duration::from_secs(8)) {
+        if !worker_started.load(Ordering::Relaxed)
+            && stopping.is_some_and(|at| at.elapsed() > Duration::from_secs(8))
+        {
             // Close a pending pkexec authorization dialog as well.
             let _ = child.kill();
         }
@@ -255,6 +272,11 @@ pub fn worker_main() -> Result<(), String> {
     {
         return Err("The worker requires an absolute path to the selected tool.".into());
     }
+    if request.nmcli.as_ref().is_some_and(|path| {
+        !path.is_absolute() || path.file_name().and_then(|name| name.to_str()) != Some("nmcli")
+    }) {
+        return Err("The worker requires an absolute path to nmcli.".into());
+    }
     let cancelled = Arc::new(AtomicBool::new(false));
     let flag = cancelled.clone();
     thread::spawn(move || {
@@ -262,7 +284,11 @@ pub fn worker_main() -> Result<(), String> {
         let _ = input.read_line(&mut control);
         flag.store(true, Ordering::Relaxed);
     });
-    execute(request, cancelled, emit)
+    let result = execute(request, cancelled, emit);
+    if let Err(error) = &result {
+        emit(Event::Error(error.clone()));
+    }
+    result
 }
 
 /// Each worker owns its tool's process group and can signal it even when root.
@@ -280,8 +306,108 @@ fn execute(
         });
         return Ok(());
     }
-    let mut child = Command::new(&request.executable)
-        .args(&spec.args)
+    sink(Event::Started);
+    if let Operation::Monitor {
+        interface,
+        enable,
+        restore,
+    } = &request.operation
+    {
+        let host = MonitorHost {
+            request: &request,
+            cancel,
+            sink: sink.clone(),
+        };
+        if *enable {
+            monitor::enable(&host, interface)?;
+        } else {
+            monitor::disable(&host, interface, restore.as_ref())?;
+        }
+        sink(Event::Finished {
+            code: Some(0),
+            cancelled: *enable && host.cancel.load(Ordering::Relaxed),
+        });
+        return Ok(());
+    }
+    let result = run_process(
+        &request.executable,
+        &spec.args,
+        Some(&request.operation),
+        cancel,
+        sink.clone(),
+        None,
+    )?;
+    sink(Event::Finished {
+        code: result.code,
+        cancelled: result.cancelled,
+    });
+    Ok(())
+}
+
+struct MonitorHost<'a, F> {
+    request: &'a Request,
+    cancel: Arc<AtomicBool>,
+    sink: Arc<F>,
+}
+
+impl<F: Fn(Event) + Send + Sync + 'static> monitor::Host for MonitorHost<'_, F> {
+    fn interfaces(&self) -> Vec<Interface> {
+        crate::model::interfaces()
+    }
+    fn has_nmcli(&self) -> bool {
+        self.request.nmcli.is_some()
+    }
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+    fn emit(&self, event: Event) {
+        (self.sink)(event);
+    }
+    fn run(&self, tool: Tool, args: &[&str], cleanup: bool) -> Result<monitor::Output, String> {
+        let executable = if tool == Tool::Nmcli {
+            self.request.nmcli.as_ref().ok_or("nmcli is unavailable.")?
+        } else {
+            &self.request.executable
+        };
+        let spec = CommandSpec {
+            tool,
+            args: args.iter().map(|arg| arg.to_string()).collect(),
+            privileged: true,
+        };
+        self.emit(Event::Line(format!("$ {}", spec.preview())));
+        let cancel = if cleanup {
+            Arc::new(AtomicBool::new(false))
+        } else {
+            self.cancel.clone()
+        };
+        run_process(
+            executable,
+            &spec.args,
+            None,
+            cancel,
+            self.sink.clone(),
+            Some(Duration::from_secs(30)),
+        )
+    }
+}
+
+fn run_process(
+    executable: &Path,
+    args: &[String],
+    operation: Option<&Operation>,
+    cancel: Arc<AtomicBool>,
+    sink: Arc<impl Fn(Event) + Send + Sync + 'static>,
+    timeout: Option<Duration>,
+) -> Result<monitor::Output, String> {
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(monitor::Output {
+            code: None,
+            cancelled: true,
+            stdout: String::new(),
+        });
+    }
+    let mut child = Command::new(executable)
+        .args(args)
         .env("LC_ALL", "C")
         .env("TERM", "dumb")
         .stdin(Stdio::null())
@@ -289,19 +415,31 @@ fn execute(
         .stderr(Stdio::piped())
         .process_group(0)
         .spawn()
-        .map_err(|e| format!("Cannot run {}: {e}", spec.tool.name()))?;
-    sink(Event::Started);
+        .map_err(|e| format!("Cannot run {}: {e}", executable.display()))?;
     let group = Pid::from_raw(child.id() as i32);
     let out = child.stdout.take().unwrap();
     let err = child.stderr.take().unwrap();
     let output_sink = sink.clone();
-    let reader = thread::spawn(move || read_output(out, |s| output_sink(Event::Line(s))));
+    let reader = thread::spawn(move || {
+        let mut captured = String::new();
+        read_output(out, |s| {
+            if captured.len() + s.len() < 65536 {
+                captured.push_str(&s);
+                captured.push('\n');
+            }
+            output_sink(Event::Line(s));
+        });
+        captured
+    });
     let error_sink = sink.clone();
     let errors = thread::spawn(move || read_output(err, |s| error_sink(Event::Line(s))));
     let mut stopped_at = None;
+    let started_at = Instant::now();
+    let mut timed_out = false;
     let mut last_snapshot = Instant::now() - Duration::from_secs(2);
     let status = loop {
-        if cancel.load(Ordering::Relaxed) && stopped_at.is_none() {
+        timed_out |= timeout.is_some_and(|limit| started_at.elapsed() >= limit);
+        if (cancel.load(Ordering::Relaxed) || timed_out) && stopped_at.is_none() {
             let _ = killpg(group, Signal::SIGINT);
             stopped_at = Some(Instant::now());
         }
@@ -309,7 +447,9 @@ fn execute(
             let _ = killpg(group, Signal::SIGKILL);
         }
         if last_snapshot.elapsed() >= Duration::from_secs(1) {
-            snapshot(&request.operation, &*sink);
+            if let Some(operation) = operation {
+                snapshot(operation, &*sink);
+            }
             last_snapshot = Instant::now();
         }
         match child.try_wait() {
@@ -325,14 +465,22 @@ fn execute(
     };
     // A script can exit while descendants still own its pipes.
     let _ = killpg(group, Signal::SIGKILL);
-    let _ = reader.join();
+    let stdout = reader.join().unwrap_or_default();
     let _ = errors.join();
-    snapshot(&request.operation, &*sink);
-    sink(Event::Finished {
+    if let Some(operation) = operation {
+        snapshot(operation, &*sink);
+    }
+    if timed_out {
+        return Err(format!(
+            "{} timed out; its process group was stopped.",
+            executable.display()
+        ));
+    }
+    Ok(monitor::Output {
         code: status.code(),
         cancelled: stopped_at.is_some(),
-    });
-    Ok(())
+        stdout,
+    })
 }
 
 fn snapshot(operation: &Operation, sink: &impl Fn(Event)) {
@@ -402,6 +550,7 @@ mod tests {
             execute(
                 Request {
                     executable: fake,
+                    nmcli: None,
                     operation: Operation::Check,
                 },
                 flag,

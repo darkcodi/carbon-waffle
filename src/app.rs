@@ -1,6 +1,7 @@
 use crate::{
     command::{Engine, Operation, Tool, find_tool},
     model::{self, Interface, Network, Survey, absolute_path},
+    monitor::NetworkRestore,
     runner::{Event, Job, Runner},
 };
 use iced::{Subscription, Task};
@@ -128,6 +129,7 @@ pub struct App {
     interfaces: Vec<Interface>,
     interface: Option<Interface>,
     owned_monitor: Option<Interface>,
+    network_restore: Option<NetworkRestore>,
     survey: Survey,
     target: Option<Network>,
     filter: String,
@@ -168,6 +170,7 @@ impl App {
             interfaces: vec![],
             interface: None,
             owned_monitor: None,
+            network_restore: None,
             survey: Survey::default(),
             target: None,
             filter: String::new(),
@@ -370,7 +373,7 @@ impl App {
         let path = |name: &str| self.session.join(format!("{name}-{}", self.next_id + 1));
         match action {
             Action::Monitor => {
-                if self.owned_monitor.is_some() {
+                if self.owned_monitor.is_some() || self.network_restore.is_some() {
                     return Err("Restore the current adapter before enabling another.".into());
                 }
                 if interface()?.monitor {
@@ -379,12 +382,10 @@ impl App {
                 Ok(Operation::Monitor {
                     interface: interface()?.name.clone(),
                     enable: true,
+                    restore: None,
                 })
             }
-            Action::Restore => Ok(Operation::Monitor {
-                interface: monitor()?,
-                enable: false,
-            }),
+            Action::Restore => self.restoration_operation(),
             Action::Check => Ok(Operation::Check),
             Action::Scan => Ok(Operation::Scan {
                 interface: monitor()?,
@@ -457,6 +458,30 @@ impl App {
         }
     }
 
+    fn restoration_operation(&self) -> Result<Operation, String> {
+        let name = self
+            .owned_monitor
+            .as_ref()
+            .map(|interface| interface.name.clone())
+            .or_else(|| {
+                self.network_restore
+                    .as_ref()
+                    .map(|restore| restore.interface.clone())
+            })
+            .or_else(|| {
+                self.interface
+                    .as_ref()
+                    .filter(|interface| interface.monitor)
+                    .map(|interface| interface.name.clone())
+            })
+            .ok_or("No adapter needs restoration.")?;
+        Ok(Operation::Monitor {
+            interface: name,
+            enable: false,
+            restore: self.network_restore.clone(),
+        })
+    }
+
     fn run(&mut self, action: Action) {
         if self.closing || self.pending.is_some() {
             return;
@@ -519,7 +544,7 @@ impl App {
         }
     }
 
-    fn finished(&mut self, id: u64, code: Option<i32>, cancelled: bool, error: Option<String>) {
+    fn finished(&mut self, id: u64, code: Option<i32>, cancelled: bool, mut error: Option<String>) {
         let Some(index) = self.jobs.iter().position(|j| j.id == id) else {
             return;
         };
@@ -553,12 +578,20 @@ impl App {
             };
         }
         match &job.operation {
-            Operation::Monitor { enable, interface } => {
+            Operation::Monitor {
+                enable, interface, ..
+            } => {
                 let old_phy = self
                     .interfaces
                     .iter()
                     .find(|i| &i.name == interface)
                     .map(|i| i.phy.clone());
+                let old_monitors: Vec<_> = self
+                    .interfaces
+                    .iter()
+                    .filter(|iface| iface.monitor)
+                    .map(|iface| iface.name.clone())
+                    .collect();
                 if self.demo && ok {
                     self.interfaces = vec![Interface {
                         name: if *enable { "wlan0mon" } else { "wlan0" }.into(),
@@ -571,26 +604,30 @@ impl App {
                     if let Some(found) = self
                         .interfaces
                         .iter()
-                        .find(|i| i.monitor && Some(&i.phy) == old_phy.as_ref())
+                        .find(|i| {
+                            i.monitor
+                                && Some(&i.phy) == old_phy.as_ref()
+                                && !old_monitors.contains(&i.name)
+                        })
                         .cloned()
                     {
                         self.owned_monitor = Some(found.clone());
                         self.interface = Some(found);
-                    } else {
-                        self.status = "Monitor mode was not detected. Check tool output and refresh adapters.".into();
+                    } else if !cancelled {
+                        error.get_or_insert_with(|| "Monitor mode was not detected on the selected adapter. Another network manager or supplicant may still be using it; see Activity.".into());
                     }
                 } else if let Some(owned) = &self.owned_monitor {
                     if !self
                         .interfaces
                         .iter()
-                        .any(|i| i.monitor && i.phy == owned.phy)
+                        .any(|i| i.monitor && i.name == owned.name)
                     {
                         self.owned_monitor = None;
-                    } else if self.closing {
-                        self.fail(
+                    } else {
+                        error.get_or_insert_with(|| {
                             "Adapter restoration did not complete; retry Restore managed mode."
-                                .into(),
-                        );
+                                .into()
+                        });
                     }
                 }
             }
@@ -636,6 +673,11 @@ impl App {
                             }
                         }
                         Event::Line(line) => self.log(id, line),
+                        Event::NetworkRestore(restore) => self.network_restore = restore,
+                        Event::MonitorReady(interface) => {
+                            self.owned_monitor = Some(interface.clone());
+                            self.interface = Some(interface);
+                        }
                         Event::Survey(survey) => {
                             if self.jobs.iter().any(|j| {
                                 j.id == id && matches!(j.operation, Operation::Scan { .. })
@@ -657,11 +699,11 @@ impl App {
                     self.launch(operation);
                 }
                 if self.closing && self.jobs.is_empty() {
-                    if let Some(interface) = self.owned_monitor.clone() {
-                        self.launch(Operation::Monitor {
-                            interface: interface.name,
-                            enable: false,
-                        });
+                    if self.owned_monitor.is_some() || self.network_restore.is_some() {
+                        match self.restoration_operation() {
+                            Ok(operation) => self.launch(operation),
+                            Err(error) => self.fail(error),
+                        }
                     } else {
                         return iced::exit();
                     }
@@ -685,7 +727,10 @@ impl App {
                 }
             }
             Message::Demo => {
-                if self.jobs.is_empty() && self.owned_monitor.is_none() {
+                if self.jobs.is_empty()
+                    && self.owned_monitor.is_none()
+                    && self.network_restore.is_none()
+                {
                     self.demo = !self.demo;
                     self.page = Page::Monitoring;
                     self.panels = Panels::default();

@@ -1,6 +1,7 @@
 mod app;
 mod command;
 mod model;
+mod monitor;
 mod runner;
 
 fn main() -> iced::Result {

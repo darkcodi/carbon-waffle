@@ -14,16 +14,18 @@ pub enum Tool {
     Aircrack,
     Hashcat,
     Hcx,
+    Nmcli,
 }
 
 impl Tool {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Airmon,
         Self::Airodump,
         Self::Aireplay,
         Self::Aircrack,
         Self::Hashcat,
         Self::Hcx,
+        Self::Nmcli,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -33,6 +35,7 @@ impl Tool {
             Self::Aircrack => "aircrack-ng",
             Self::Hashcat => "hashcat",
             Self::Hcx => "hcxpcapngtool",
+            Self::Nmcli => "nmcli",
         }
     }
 }
@@ -56,6 +59,8 @@ pub enum Operation {
     Monitor {
         interface: String,
         enable: bool,
+        #[serde(default)]
+        restore: Option<crate::monitor::NetworkRestore>,
     },
     Check,
     Scan {
@@ -173,14 +178,28 @@ impl Operation {
             }
         };
         let (tool, args, privileged) = match self {
-            Self::Monitor { interface, enable } => (
-                Tool::Airmon,
-                vec![
-                    if *enable { "start" } else { "stop" }.into(),
-                    iface(interface)?,
-                ],
-                true,
-            ),
+            Self::Monitor {
+                interface,
+                enable,
+                restore,
+            } => {
+                if let Some(restore) = restore {
+                    restore.validate()?;
+                    if *enable {
+                        return Err(
+                            "A new monitoring session cannot carry restoration state.".into()
+                        );
+                    }
+                }
+                (
+                    Tool::Airmon,
+                    vec![
+                        if *enable { "start" } else { "stop" }.into(),
+                        iface(interface)?,
+                    ],
+                    true,
+                )
+            }
             Self::Check => (Tool::Airmon, vec!["check".into()], true),
             Self::Scan { interface, prefix } => (
                 Tool::Airodump,

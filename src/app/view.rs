@@ -40,7 +40,10 @@ impl App {
                 .size(12)
             )
             .on_press_maybe(
-                (self.jobs.is_empty() && self.owned_monitor.is_none() && !self.closing)
+                (self.jobs.is_empty()
+                    && self.owned_monitor.is_none()
+                    && self.network_restore.is_none()
+                    && !self.closing)
                     .then_some(Message::Demo)
             )
             .style(style::secondary)
@@ -252,7 +255,7 @@ impl App {
                 } else if self.interfaces.is_empty() {
                     "No wireless adapters found. Connect an adapter and refresh."
                 } else {
-                    "Your adapter may disconnect from Wi-Fi when monitoring starts."
+                    "This adapter disconnects from Wi-Fi until you restore managed mode."
                 })
                 .size(12)
                 .color(if monitor { style::ACCENT } else { style::MUTED }),
@@ -274,6 +277,11 @@ impl App {
                     )
                     .center_x(Fill),
                 );
+        } else if self.network_restore.is_some() || self.owned_monitor.is_some() {
+            content = content.push(
+                self.action("Restore managed mode", Action::Restore, idle)
+                    .width(Fill),
+            );
         } else {
             content = content.push(
                 self.action(
@@ -314,7 +322,7 @@ impl App {
                 });
             content = content.push(container(column![tools,
                 self.action("Check interfering processes", Action::Check, idle).style(style::secondary).width(Fill),
-                text("Radio commands use desktop authorization. Existing networking services are left running.").size(12).color(style::MUTED),
+                text("The selected adapter is temporarily released from NetworkManager. Other adapters and networking services stay running.").size(12).color(style::MUTED),
             ].spacing(18)).padding(20).width(Fill).style(style::card));
         }
         container(content).width(Fill).max_width(490).into()
