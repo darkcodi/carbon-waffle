@@ -1,6 +1,6 @@
 use super::{
-    Action, App, Authorization, CommandActivity, Engine, Message, Network, Operation, Page, Panel,
-    RecoveryMode, Tool, appearance as style,
+    Action, App, Authorization, CommandActivity, Engine, Flow, Message, Network, Operation, Page,
+    Panel, RecoveryMode, Tool, appearance as style,
 };
 use iced::{
     Border, Center, Element, Fill, Font, Length, Theme,
@@ -14,22 +14,46 @@ impl App {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
+        let tabs =
+            [Flow::Capture, Flow::Recover]
+                .into_iter()
+                .fold(row![].spacing(6), |tabs, flow| {
+                    let selected = self.flow == flow;
+                    tabs.push(
+                        button(
+                            text(if flow == Flow::Capture {
+                                "Capture"
+                            } else {
+                                "Recover"
+                            })
+                            .size(14),
+                        )
+                        .on_press_maybe((!self.closing).then_some(Message::Flow(flow)))
+                        .padding([10, 24])
+                        .style(move |_, status| style::choice(selected, status)),
+                    )
+                });
         let header = row![
             text("carbon").font(style::SEMIBOLD).size(21),
             text("waffle").color(style::MUTED).size(21),
+            widget::space().width(Fill),
+            tabs,
         ]
         .align_y(Center)
         .spacing(5);
 
-        let screen = match self.page {
-            Page::Elevate => self.elevate(),
-            Page::Monitoring => self.monitoring(),
-            Page::Discover => self.discover(),
-            Page::Capture => self.capture(),
-            Page::Recover => self.recover(),
+        let screen = if self.flow == Flow::Recover {
+            self.recover()
+        } else {
+            match self.page {
+                Page::Elevate => self.elevate(),
+                Page::Monitoring => self.monitoring(),
+                Page::Discover => self.discover(),
+                Page::Capture => self.capture(),
+            }
         };
         let stage = scrollable(container(screen).center_x(Fill).padding(iced::Padding {
-            top: if matches!(self.page, Page::Capture | Page::Recover) {
+            top: if self.page == Page::Capture || self.flow == Flow::Recover {
                 8.0
             } else {
                 16.0
@@ -81,23 +105,27 @@ impl App {
             );
         }
 
-        let mut layout = column![
-            header,
-            container(self.steps())
-                .center_x(Fill)
-                .padding(iced::Padding {
-                    top: 28.0,
-                    bottom: 8.0,
-                    ..Default::default()
-                }),
-            stage,
-            self.navigation(),
-            widget::rule::horizontal(1).style(style::divider),
-            footer,
-        ]
-        .width(Fill)
-        .height(Fill)
-        .spacing(8);
+        let mut layout = column![header].width(Fill).height(Fill).spacing(8);
+        if self.flow == Flow::Capture {
+            layout = layout.push(
+                container(self.steps())
+                    .center_x(Fill)
+                    .padding(iced::Padding {
+                        top: 28.0,
+                        bottom: 8.0,
+                        ..Default::default()
+                    }),
+            );
+        } else {
+            layout = layout.push(widget::space().height(12));
+        }
+        layout = layout.push(stage);
+        if self.flow == Flow::Capture {
+            layout = layout.push(self.navigation());
+        }
+        layout = layout
+            .push(widget::rule::horizontal(1).style(style::divider))
+            .push(footer);
         if self.panels.activity {
             layout = layout.push(self.activity_view());
         }
@@ -818,9 +846,9 @@ impl App {
                 }
                 .into(),
                 if self.demo {
-                    "This is a simulated result. Choose Next to preview password recovery."
+                    "This is a simulated result. Open it in Recover to preview password recovery."
                 } else {
-                    "Your recording contains a handshake for this network. Choose Next to open Recover and select a wordlist."
+                    "Your recording contains a handshake for this network. Open it in Recover now, or use the saved file later."
                 },
                 false,
             )
@@ -964,10 +992,17 @@ impl App {
                 );
             } else if found {
                 body = body.push(
-                    text("Ready for Recover →")
-                        .size(13)
-                        .font(style::SEMIBOLD)
-                        .color(style::ACCENT),
+                    button(
+                        text("Open in Recover →")
+                            .size(15)
+                            .font(style::SEMIBOLD)
+                            .align_x(Center)
+                            .width(Fill),
+                    )
+                    .on_press_maybe(self.can_use_capture().then_some(Message::UseCapture))
+                    .padding([15, 20])
+                    .width(Fill)
+                    .style(style::primary),
                 );
             } else if self.capture_check == Some(super::Inspection::NotFound)
                 || !self.capture_available
@@ -1145,7 +1180,10 @@ impl App {
         let offline = self.jobs.iter().find(|job| {
             matches!(
                 job.operation,
-                Operation::Crack { .. } | Operation::Convert { .. } | Operation::Inspect { .. }
+                Operation::Crack { .. }
+                    | Operation::Convert { .. }
+                    | Operation::Inspect { .. }
+                    | Operation::ReadCapture { .. }
             )
         });
         let idle = !self.offline_busy() && !self.radio_busy();
@@ -1182,15 +1220,14 @@ impl App {
         let mut content = column![
             heading(
                 "Recover the password.",
-                "Try complete passwords or build candidates from a pattern."
+                "Open a saved capture or hash file. No elevation or Wi-Fi adapter needed."
             ),
             engine,
         ]
-        .spacing(10)
+        .spacing(8)
         .width(Fill);
-        let mut settings = column![].spacing(12).width(Fill);
         if is_hashcat {
-            settings = settings
+            content = content
                 .push(field(
                     "Hash file",
                     "/path/to/handshake.hc22000",
@@ -1203,19 +1240,19 @@ impl App {
                     Panel::Conversion,
                 ));
             if self.panels.conversion {
-                settings = settings.push(
+                content = content.push(
                     container(
                         column![
                             field(
                                 "Capture file",
                                 "/path/to/capture.cap",
-                                &self.capture_path,
-                                Message::CapturePath
+                                &self.recovery_capture_path,
+                                Message::RecoveryCapturePath
                             ),
                             self.action(
                                 "Convert capture",
                                 Action::Convert,
-                                idle && !self.capture_path.is_empty()
+                                idle && !self.recovery_capture_path.is_empty()
                             )
                             .style(style::secondary)
                             .width(Fill),
@@ -1228,33 +1265,58 @@ impl App {
                 );
             }
         } else {
-            settings = settings.push(field(
-                "Capture file",
-                "/path/to/capture.cap",
-                &self.capture_path,
-                Message::CapturePath,
-            ));
-            let selected = self
-                .target
-                .as_ref()
-                .map_or("Select a target in Discover".into(), |network| {
-                    format!("Target: {}", network.label())
-                });
-            settings = settings.push(
+            content = content.push(
                 row![
-                    text(selected).size(12).color(style::MUTED).width(Fill),
-                    link("Change", Message::Page(Page::Discover)),
+                    container(field(
+                        "Capture file",
+                        "/path/to/capture.cap",
+                        &self.recovery_capture_path,
+                        Message::RecoveryCapturePath
+                    ))
+                    .width(Fill),
                     self.action(
-                        "Inspect",
-                        Action::Inspect,
-                        idle && self.target.is_some() && !self.capture_path.is_empty()
+                        "Read capture",
+                        Action::ReadCapture,
+                        idle && !self.recovery_capture_path.trim().is_empty()
                     )
-                    .style(style::quiet)
-                    .padding([6, 4])
-                    .width(76),
+                    .style(style::secondary)
+                    .padding([12, 14]),
                 ]
-                .align_y(Center),
+                .spacing(10)
+                .align_y(iced::Bottom),
             );
+            if self.recovery_networks.is_empty() {
+                content = content.push(field(
+                    "Network BSSID · read the capture to fill this",
+                    "AA:BB:CC:DD:EE:FF",
+                    &self.recovery_bssid,
+                    Message::RecoveryBssid,
+                ));
+            } else {
+                let selected = self
+                    .recovery_networks
+                    .iter()
+                    .find(|network| network.bssid.eq_ignore_ascii_case(&self.recovery_bssid));
+                content = content.push(
+                    column![
+                        text("Network in this capture").size(12).color(style::MUTED),
+                        pick_list(
+                            self.recovery_networks.as_slice(),
+                            selected,
+                            Message::RecoveryNetwork
+                        )
+                        .placeholder("Choose a network")
+                        .padding(12)
+                        .text_size(13)
+                        .style(style::select)
+                        .width(Fill),
+                    ]
+                    .spacing(8),
+                );
+                if selected.is_some_and(|network| network.handshakes == 0) {
+                    content = content.push(text("No handshake found for this network. Choose another network or capture file.").size(12).color(style::ERROR));
+                }
+            }
         }
         let modes = [RecoveryMode::Dictionary, RecoveryMode::Pattern]
             .into_iter()
@@ -1323,11 +1385,12 @@ impl App {
             let has_input = if is_hashcat {
                 !self.hash_path.is_empty()
             } else {
-                !self.capture_path.is_empty()
-                    && self
-                        .target
-                        .as_ref()
-                        .is_some_and(|target| target.supports_dictionary())
+                !self.recovery_capture_path.trim().is_empty()
+                    && crate::model::valid_mac(&self.recovery_bssid)
+                    && !self.recovery_networks.iter().any(|network| {
+                        network.bssid.eq_ignore_ascii_case(&self.recovery_bssid)
+                            && network.handshakes == 0
+                    })
             };
             let start = self
                 .action(
@@ -1398,26 +1461,15 @@ impl App {
             content = content.push(self.pattern_help(idle));
             content = content.push(text("Candidates are generated on demand. No combined wordlist is saved; large combinations can still take a long time.").size(12).color(style::MUTED));
         }
-        content = content.push(disclosure(
-            "Input file settings",
-            self.panels.recovery_settings,
-            Panel::RecoverySettings,
-        ));
-        if self.panels.recovery_settings {
+        if self.radio_busy() {
             content = content.push(
-                container(settings)
-                    .padding(16)
-                    .width(Fill)
-                    .style(style::card),
-            );
-        } else if (is_hashcat && self.hash_path.is_empty())
-            || (!is_hashcat && self.capture_path.is_empty())
-        {
-            content = content.push(
-                text("Choose a file in input file settings to begin.")
+                text("Stop the active Capture job before starting recovery.")
                     .size(12)
                     .color(style::MUTED),
             );
+        }
+        if let Some(error) = &self.save_error {
+            content = content.push(text(error).size(12).color(style::ERROR));
         }
         let required_tool = if is_hashcat {
             Tool::Hashcat
@@ -1570,7 +1622,8 @@ impl App {
         .padding([14, 20])
         .on_press_maybe(
             (enabled
-                && self.authorization == Authorization::Ready
+                && (!action.requires_authorization()
+                    || self.authorization == Authorization::Ready)
                 && !self.closing
                 && self.pending.is_none())
             .then_some(Message::Run(action)),

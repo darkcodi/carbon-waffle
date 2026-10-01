@@ -26,7 +26,7 @@ use std::{
 
 mod inspection;
 mod session;
-pub use inspection::Inspection;
+pub use inspection::{CaptureNetwork, Inspection};
 pub use session::{Authorization, session_worker_main};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +35,7 @@ pub enum Event {
     Line(String),
     Survey(Survey),
     Inspection(Inspection),
+    CaptureNetworks(Vec<CaptureNetwork>),
     Candidates { generated: u64, total: String },
     NetworkRestore(Option<NetworkRestore>),
     MonitorReady(Interface),
@@ -153,6 +154,18 @@ impl Runner {
                 ));
                 if matches!(operation, Operation::Inspect { .. }) && !flag.load(Ordering::Relaxed) {
                     let _ = sender.send((id, Event::Inspection(Inspection::Found)));
+                }
+                if matches!(operation, Operation::ReadCapture { .. })
+                    && !flag.load(Ordering::Relaxed)
+                {
+                    let _ = sender.send((
+                        id,
+                        Event::CaptureNetworks(vec![CaptureNetwork {
+                            bssid: "02:00:00:00:00:01".into(),
+                            ssid: "Demo capture".into(),
+                            handshakes: 1,
+                        }]),
+                    ));
                 }
                 let _ = sender.send((
                     id,
@@ -349,6 +362,9 @@ fn execute(
         return Ok(());
     }
     sink(Event::Started);
+    if matches!(request.operation, Operation::ReadCapture { .. }) {
+        return inspection::list(&request.executable, &spec.args, cancel, sink);
+    }
     if let Operation::Inspect { bssid, .. } = &request.operation {
         return inspection::run(&request.executable, &spec.args, bssid, cancel, sink);
     }
@@ -649,6 +665,12 @@ fn read_output(reader: impl Read, mut sink: impl FnMut(String)) {
                     }
                     if byte != b'\n' && byte != b'\r' {
                         line.push(byte);
+                        // Aircrack's selection prompt has no trailing newline.
+                        // Publish it so capture listing can stop at the prompt.
+                        if line.ends_with(b"Index number of target network ? ") {
+                            sink(clean_terminal(&String::from_utf8_lossy(&line)));
+                            line.clear();
+                        }
                     }
                 }
             }

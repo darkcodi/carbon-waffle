@@ -174,6 +174,8 @@ fn recover_previews() {
     let directory = PathBuf::from("target/recover-previews");
     fs::create_dir_all(&directory).unwrap();
     for name in [
+        "empty",
+        "loaded",
         "dictionary",
         "pattern",
         "preview",
@@ -183,14 +185,31 @@ fn recover_previews() {
         "hashcat",
     ] {
         let mut app = App::new(true);
-        app.page = Page::Recover;
-        app.capture_path = "/home/researcher/captures/capture-4-01.cap".into();
+        app.flow = Flow::Recover;
+        app.recovery_capture_path = "/home/researcher/captures/capture-4-01.cap".into();
+        app.recovery_bssid = "02:00:00:00:00:01".into();
         app.hash_path = "/home/researcher/captures/handshake.hc22000".into();
         app.wordlist = "/home/researcher/wordlists/words.txt".into();
-        app.target.as_mut().unwrap().ssid = "Research Wi-Fi".into();
+        app.target = None;
+        app.interface = None;
+        app.interfaces.clear();
+        app.authorization = Authorization::Idle;
         app.status = "Ready to recover the password.".into();
-        if name != "dictionary" {
+        if !matches!(name, "dictionary" | "empty") {
             let _ = app.update(Message::RecoveryMode(RecoveryMode::Pattern));
+        }
+        if name == "empty" {
+            app.recovery_capture_path.clear();
+            app.recovery_bssid.clear();
+            app.hash_path.clear();
+            app.wordlist.clear();
+        }
+        if name == "loaded" {
+            app.recovery_networks = vec![crate::runner::CaptureNetwork {
+                bssid: app.recovery_bssid.clone(),
+                ssid: "Research Wi-Fi".into(),
+                handshakes: 1,
+            }];
         }
         if name == "preview" {
             app.pattern_preview = Some(Ok(pattern::Preview {

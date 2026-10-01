@@ -6,6 +6,7 @@ use crate::{
     runner::{Authorization, Event, Inspection, Job, Runner},
 };
 use iced::{Subscription, Task};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashSet, VecDeque},
     fs,
@@ -19,6 +20,7 @@ use std::{
 };
 
 mod appearance;
+mod recovery;
 mod view;
 
 #[cfg(test)]
@@ -30,16 +32,14 @@ pub enum Page {
     Monitoring,
     Discover,
     Capture,
-    Recover,
 }
 
 impl Page {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 4] = [
         Self::Elevate,
         Self::Monitoring,
         Self::Discover,
         Self::Capture,
-        Self::Recover,
     ];
 
     fn label(self) -> &'static str {
@@ -48,7 +48,6 @@ impl Page {
             Self::Monitoring => "Monitoring",
             Self::Discover => "Discover",
             Self::Capture => "Capture",
-            Self::Recover => "Recover",
         }
     }
 
@@ -63,6 +62,12 @@ impl Page {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Flow {
+    Capture,
+    Recover,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum Panel {
     Activity,
@@ -73,7 +78,6 @@ pub enum Panel {
     Conversion,
     Session,
     PatternHelp,
-    RecoverySettings,
 }
 
 #[derive(Default)]
@@ -86,10 +90,9 @@ struct Panels {
     conversion: bool,
     session: bool,
     pattern_help: bool,
-    recovery_settings: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RecoveryMode {
     Dictionary,
     Pattern,
@@ -103,8 +106,18 @@ pub enum Action {
     Capture,
     Deauth,
     Inspect,
+    ReadCapture,
     Convert,
     Crack,
+}
+
+impl Action {
+    fn requires_authorization(self) -> bool {
+        matches!(
+            self,
+            Self::Monitor | Self::Restore | Self::Scan | Self::Capture | Self::Deauth
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +126,8 @@ pub enum Message {
     Elevate,
     Authorization(Authorization),
     Page(Page),
+    Flow(Flow),
+    UseCapture,
     Back,
     Next,
     Interface(Interface),
@@ -123,6 +138,9 @@ pub enum Message {
     Station(String),
     Count(String),
     CapturePath(String),
+    RecoveryCapturePath(String),
+    RecoveryBssid(String),
+    RecoveryNetwork(crate::runner::CaptureNetwork),
     HashPath(String),
     Wordlist(String),
     RecoveryMode(RecoveryMode),
@@ -165,6 +183,7 @@ impl CommandActivity {
 }
 
 pub struct App {
+    flow: Flow,
     page: Page,
     demo: bool,
     interfaces: Vec<Interface>,
@@ -184,6 +203,11 @@ pub struct App {
     check_after_capture: bool,
     capture_started: Option<Instant>,
     hash_path: String,
+    recovery_capture_path: String,
+    recovery_bssid: String,
+    recovery_networks: Vec<crate::runner::CaptureNetwork>,
+    state_path: Option<PathBuf>,
+    save_error: Option<String>,
     wordlist: String,
     recovery_mode: RecoveryMode,
     pattern: String,
@@ -213,6 +237,10 @@ impl App {
     pub fn boot() -> (Self, Task<Message>) {
         let demo = std::env::args().any(|arg| arg == "--demo");
         let mut app = Self::new(demo);
+        if !demo {
+            app.state_path = recovery::state_path();
+            app.load_recovery();
+        }
         // Lifecycle notifications wake the UI directly; no idle polling is
         // needed to detect authorization or an unexpectedly disconnected helper.
         let updates = app.runner.authorization.take().unwrap();
@@ -229,6 +257,7 @@ impl App {
             .join("captures")
             .join(format!("session-{stamp}-{}", std::process::id()));
         let mut app = Self {
+            flow: Flow::Capture,
             page: Page::Elevate,
             demo,
             interfaces: vec![],
@@ -248,6 +277,11 @@ impl App {
             check_after_capture: false,
             capture_started: None,
             hash_path: String::new(),
+            recovery_capture_path: String::new(),
+            recovery_bssid: String::new(),
+            recovery_networks: vec![],
+            state_path: None,
+            save_error: None,
             wordlist: String::new(),
             recovery_mode: RecoveryMode::Dictionary,
             pattern: "{Word}{Word}[0-9]{3}".into(),
@@ -360,21 +394,28 @@ impl App {
         self.jobs.iter().any(|j| {
             matches!(
                 j.operation,
-                Operation::Inspect { .. } | Operation::Convert { .. } | Operation::Crack { .. }
+                Operation::Inspect { .. }
+                    | Operation::ReadCapture { .. }
+                    | Operation::Convert { .. }
+                    | Operation::Crack { .. }
             )
         })
     }
 
     fn can_select_page(&self, page: Page) -> bool {
-        !self.closing && page <= self.page
+        !self.closing && self.flow == Flow::Capture && page <= self.page
     }
 
     fn can_go_back(&self) -> bool {
-        !self.closing && self.page.previous().is_some()
+        !self.closing && self.flow == Flow::Capture && self.page.previous().is_some()
     }
 
     fn can_advance(&self) -> bool {
-        if self.closing || self.pending.is_some() || self.authorization != Authorization::Ready {
+        if self.flow != Flow::Capture
+            || self.closing
+            || self.pending.is_some()
+            || self.authorization != Authorization::Ready
+        {
             return false;
         }
         let monitor_ready = self.interface.as_ref().is_some_and(|iface| iface.monitor)
@@ -386,15 +427,39 @@ impl App {
             Page::Elevate => true,
             Page::Monitoring => monitor_ready,
             Page::Discover => monitor_ready && self.target.is_some(),
-            Page::Capture => {
-                self.target.is_some()
-                    && self.capture_available
-                    && self.capture_check == Some(Inspection::Found)
-                    && !self.radio_busy()
-                    && !self.offline_busy()
-            }
-            Page::Recover => false,
+            Page::Capture => false,
         }
+    }
+
+    fn can_use_capture(&self) -> bool {
+        !self.closing
+            && self.pending.is_none()
+            && self
+                .target
+                .as_ref()
+                .is_some_and(Network::supports_dictionary)
+            && self.capture_available
+            && self.capture_check == Some(Inspection::Found)
+            && !self.radio_busy()
+            && !self.offline_busy()
+    }
+
+    fn show_flow(&mut self, flow: Flow) -> Task<Message> {
+        self.flow = flow;
+        self.save_recovery();
+        if self.jobs.is_empty() {
+            self.status_error = false;
+            self.status = if flow == Flow::Recover {
+                "Open a saved capture or hash file. Recovery does not need elevated permissions."
+            } else {
+                "Capture workflow · select the current step to continue."
+            }
+            .into();
+        }
+        iced::widget::operation::scroll_to(
+            "current-step",
+            iced::widget::operation::AbsoluteOffset { x: 0.0, y: 0.0 },
+        )
     }
 
     fn show_page(&mut self, page: Page) -> Task<Message> {
@@ -482,7 +547,6 @@ impl App {
                     self.capture_available = false;
                     self.capture_check = None;
                     self.capture_started = None;
-                    self.hash_path.clear();
                 }
                 self.jobs.push(job);
             }
@@ -586,14 +650,16 @@ impl App {
                 bssid: target()?.bssid.clone(),
             }),
             Action::Convert => Ok(Operation::Convert {
-                capture: absolute_path(&self.capture_path)?,
+                capture: absolute_path(&self.recovery_capture_path)?,
                 output: path("handshake").with_extension("hc22000"),
             }),
+            Action::ReadCapture => Ok(Operation::ReadCapture {
+                capture: absolute_path(&self.recovery_capture_path)?,
+            }),
             Action::Crack => {
-                if self.engine == Engine::Aircrack && !target()?.supports_dictionary() {
+                if self.engine == Engine::Aircrack && !model::valid_mac(&self.recovery_bssid) {
                     return Err(
-                        "This workflow supports WPA/WPA2 PSK recovery. Select a PSK network."
-                            .into(),
+                        "Read the saved capture and choose a network, or enter its BSSID.".into(),
                     );
                 }
                 let pattern =
@@ -605,7 +671,7 @@ impl App {
                 Ok(Operation::Crack {
                     engine: self.engine,
                     input: absolute_path(if self.engine == Engine::Aircrack {
-                        &self.capture_path
+                        &self.recovery_capture_path
                     } else {
                         &self.hash_path
                     })?,
@@ -615,11 +681,7 @@ impl App {
                         PathBuf::new()
                     },
                     pattern,
-                    bssid: self
-                        .target
-                        .as_ref()
-                        .map(|n| n.bssid.clone())
-                        .unwrap_or_default(),
+                    bssid: self.recovery_bssid.clone(),
                     output: path("recovered").with_extension("txt"),
                 })
             }
@@ -651,7 +713,7 @@ impl App {
     }
 
     fn run(&mut self, action: Action) {
-        if self.authorization != Authorization::Ready {
+        if action.requires_authorization() && self.authorization != Authorization::Ready {
             return;
         }
         if self.closing || self.pending.is_some() {
@@ -665,8 +727,10 @@ impl App {
             self.fail("Wait for the current file check or recovery job to finish.".into());
             return;
         }
-        if matches!(action, Action::Inspect | Action::Convert | Action::Crack)
-            && (self.offline_busy() || self.radio_busy())
+        if matches!(
+            action,
+            Action::Inspect | Action::ReadCapture | Action::Convert | Action::Crack
+        ) && (self.offline_busy() || self.radio_busy())
         {
             self.fail("Stop capture and wait for the current recovery job to finish.".into());
             return;
@@ -684,6 +748,12 @@ impl App {
         }
         if matches!(action, Action::Crack) {
             self.invalidate_preview();
+        }
+        if matches!(
+            action,
+            Action::Crack | Action::Convert | Action::ReadCapture
+        ) {
+            self.save_recovery();
         }
         let operation = match self.operation(action) {
             Ok(op) => op,
@@ -817,7 +887,7 @@ impl App {
                 self.status_error = self.capture_check == Some(Inspection::Unknown);
                 self.status = match self.capture_check {
                     Some(Inspection::Found) if self.demo => "Demo check complete · simulated handshake.".into(),
-                    Some(Inspection::Found) => "Handshake found. Choose Next to open Recover.".into(),
+                    Some(Inspection::Found) => "Handshake found. Choose Open in Recover to use this recording.".into(),
                     Some(Inspection::NotFound) => "No handshake found yet. Record again while a device reconnects.".into(),
                     _ => "Could not verify this capture. See Activity for details, then retry the check.".into(),
                 };
@@ -834,6 +904,7 @@ impl App {
             Operation::Convert { output, .. } if ok => {
                 if self.demo || fs::metadata(output).is_ok_and(|m| m.len() > 0) {
                     self.hash_path = output.to_string_lossy().into_owned();
+                    self.save_recovery();
                     self.status =
                         "Conversion finished. Review converter output for handshake quality."
                             .into();
@@ -841,6 +912,17 @@ impl App {
                     self.status =
                         "No usable hashes were written. Capture more traffic and retry.".into();
                 }
+            }
+            Operation::ReadCapture { .. } if ok => {
+                self.status = if self.recovery_networks.is_empty() {
+                    "No WPA handshake entries found. See Activity for the capture summary."
+                } else if self.recovery_bssid.is_empty() {
+                    "Capture loaded. Choose the network to recover."
+                } else {
+                    "Capture loaded. Review the network and recovery options."
+                }
+                .into();
+                self.save_recovery();
             }
             Operation::Crack { output, .. } if ok => {
                 self.status = if self.demo {
@@ -933,6 +1015,18 @@ impl App {
                                 self.capture_check = Some(result);
                             }
                         }
+                        Event::CaptureNetworks(networks) => {
+                            if self.jobs.iter().any(|job| job.id == id && matches!(&job.operation,
+                                Operation::ReadCapture { capture } if absolute_path(&self.recovery_capture_path).as_ref().ok() == Some(capture))) {
+                                self.recovery_networks = networks;
+                                if !self.recovery_networks.iter().any(|network| network.bssid.eq_ignore_ascii_case(&self.recovery_bssid)) {
+                                    let usable: Vec<_> = self.recovery_networks.iter().filter(|network| network.handshakes > 0).collect();
+                                    self.recovery_bssid = if usable.len() == 1 { usable[0].bssid.clone() }
+                                        else if self.recovery_networks.len() == 1 { self.recovery_networks[0].bssid.clone() }
+                                        else { String::new() };
+                                }
+                            }
+                        }
                         Event::Candidates { generated, total } => {
                             if self.jobs.iter().any(|job| {
                                 job.id == id
@@ -975,7 +1069,7 @@ impl App {
                 if self.check_after_capture && !self.radio_busy() && !self.offline_busy() {
                     self.check_after_capture = false;
                     self.refresh_capture_available();
-                    if !self.closing && self.authorization == Authorization::Ready {
+                    if !self.closing {
                         if self.capture_available {
                             self.run(Action::Inspect);
                         } else {
@@ -1000,15 +1094,32 @@ impl App {
                     return self.show_page(page);
                 }
             }
+            Message::Flow(flow) => {
+                if !self.closing {
+                    return self.show_flow(flow);
+                }
+            }
+            Message::UseCapture => {
+                self.refresh_capture_available();
+                if self.can_use_capture() {
+                    let target = self.target.as_ref().unwrap();
+                    self.recovery_capture_path = self.capture_path.clone();
+                    self.recovery_bssid = target.bssid.clone();
+                    // The check establishes presence, not an exact handshake count.
+                    // Keep the known BSSID; Read capture can populate the full list.
+                    self.recovery_networks.clear();
+                    self.hash_path.clear();
+                    self.engine = Engine::Aircrack;
+                    self.invalidate_preview();
+                    return self.show_flow(Flow::Recover);
+                }
+            }
             Message::Back => {
                 if self.can_go_back() {
                     return self.show_page(self.page.previous().unwrap());
                 }
             }
             Message::Next => {
-                if self.page == Page::Capture && !self.demo {
-                    self.refresh_capture_available();
-                }
                 if self.can_advance() {
                     return self.show_page(self.page.next().unwrap());
                 }
@@ -1040,7 +1151,6 @@ impl App {
                         self.capture_available = false;
                         self.capture_check = None;
                         self.capture_started = None;
-                        self.hash_path.clear();
                     }
                     self.target = Some(network.clone());
                     self.station.clear();
@@ -1061,7 +1171,29 @@ impl App {
                     self.refresh_capture_available();
                 }
             }
-            Message::HashPath(value) => self.hash_path = value,
+            Message::RecoveryCapturePath(value) => {
+                if !self.offline_busy() && self.recovery_capture_path != value {
+                    self.recovery_capture_path = value;
+                    self.recovery_bssid.clear();
+                    self.recovery_networks.clear();
+                    self.hash_path.clear();
+                }
+            }
+            Message::RecoveryBssid(value) => {
+                if !self.offline_busy() {
+                    self.recovery_bssid = value.trim().to_ascii_uppercase();
+                }
+            }
+            Message::RecoveryNetwork(network) => {
+                if !self.offline_busy() && self.recovery_networks.contains(&network) {
+                    self.recovery_bssid = network.bssid;
+                }
+            }
+            Message::HashPath(value) => {
+                if !self.offline_busy() {
+                    self.hash_path = value;
+                }
+            }
             Message::Wordlist(value) => {
                 if !self.offline_busy() {
                     self.wordlist = value;
@@ -1128,7 +1260,7 @@ impl App {
                 if revision == self.preview_revision && !self.closing {
                     self.preview_cancel = None;
                     self.pattern_preview = Some(result);
-                    if self.page == Page::Recover {
+                    if self.flow == Flow::Recover {
                         return iced::widget::operation::scroll_to(
                             "current-step",
                             iced::widget::operation::AbsoluteOffset { x: 0.0, y: 240.0 },
@@ -1136,7 +1268,11 @@ impl App {
                     }
                 }
             }
-            Message::Engine(value) => self.engine = value,
+            Message::Engine(value) => {
+                if !self.offline_busy() {
+                    self.engine = value;
+                }
+            }
             Message::Run(action) => self.run(action),
             Message::StopAndCheck => {
                 if self.capture_running()
@@ -1199,11 +1335,11 @@ impl App {
                     Panel::Conversion => &mut self.panels.conversion,
                     Panel::Session => &mut self.panels.session,
                     Panel::PatternHelp => &mut self.panels.pattern_help,
-                    Panel::RecoverySettings => &mut self.panels.recovery_settings,
                 };
                 *open = !*open;
             }
             Message::Close => {
+                self.save_recovery();
                 self.invalidate_preview();
                 self.check_after_capture = false;
                 self.closing = true;
@@ -1211,7 +1347,12 @@ impl App {
                 for job in &mut self.jobs {
                     job.stop();
                 }
-                self.status = "Stopping jobs and restoring this session’s adapter…".into();
+                self.status = if self.owned_monitor.is_some() || self.network_restore.is_some() {
+                    "Stopping jobs and restoring this session’s adapter…"
+                } else {
+                    "Stopping jobs…"
+                }
+                .into();
             }
         }
         Task::none()
@@ -1247,7 +1388,8 @@ mod tests {
     #[test]
     fn recovery_modes_keep_dictionary_and_pattern_inputs_separate() {
         let mut app = demo_app();
-        app.capture_path = "/synthetic.cap".into();
+        app.recovery_capture_path = "/synthetic.cap".into();
+        app.recovery_bssid = "02:00:00:00:00:01".into();
         app.wordlist = "/words.txt".into();
         assert!(matches!(
             app.operation(Action::Crack).unwrap(),
@@ -1472,6 +1614,79 @@ mod tests {
     }
 
     #[test]
+    fn recovery_tab_and_offline_jobs_do_not_require_capture_or_authorization() {
+        let mut app = App::new(true);
+        app.authorization = Authorization::Idle;
+        app.target = None;
+        app.interfaces.clear();
+        app.interface = None;
+        let _ = app.update(Message::Flow(Flow::Recover));
+        assert_eq!(app.flow, Flow::Recover);
+        assert_eq!(app.page, Page::Elevate);
+        assert!(!app.can_go_back());
+        assert!(!app.can_advance());
+        assert!(app.jobs.is_empty());
+        assert_eq!(app.authorization, Authorization::Idle);
+        let _ = app.update(Message::RecoveryCapturePath("/saved.cap".into()));
+        app.run(Action::ReadCapture);
+        assert_eq!(app.jobs.len(), 1);
+        assert!(!app.jobs[0].operation.spec().unwrap().privileged);
+        pump_until(&mut app, |app| app.jobs.is_empty());
+        assert_eq!(app.recovery_networks.len(), 1);
+        assert_eq!(app.recovery_bssid, "02:00:00:00:00:01");
+        for engine in [Engine::Aircrack, Engine::Hashcat] {
+            app.engine = engine;
+            app.hash_path = "/saved.hc22000".into();
+            app.run(Action::Crack);
+            assert_eq!(app.jobs.len(), 1, "{}", app.status);
+            assert!(!app.jobs[0].operation.spec().unwrap().privileged);
+            let _ = app.update(Message::StopAll);
+            pump_until(&mut app, |app| app.jobs.is_empty());
+        }
+        app.run(Action::Convert);
+        assert_eq!(app.jobs.len(), 1);
+        let _ = app.update(Message::StopAll);
+        pump_until(&mut app, |app| app.jobs.is_empty());
+        assert_eq!(app.authorization, Authorization::Idle);
+        assert!(matches!(
+            app.runner.authorization.as_mut().unwrap().try_recv(),
+            Err(iced::futures::channel::mpsc::TryRecvError::Empty)
+        ));
+        let _ = app.update(Message::Flow(Flow::Capture));
+        app.run(Action::Monitor);
+        assert!(app.jobs.is_empty(), "radio actions still require elevation");
+    }
+
+    #[test]
+    fn tab_switching_preserves_capture_step_jobs_and_independent_recovery_inputs() {
+        let mut app = demo_app();
+        app.page = Page::Discover;
+        app.recovery_capture_path = "/saved.cap".into();
+        app.recovery_bssid = "02:00:00:00:00:01".into();
+        app.hash_path = "/saved.hc22000".into();
+        app.run(Action::Scan);
+        let id = app.jobs[0].id;
+        let _ = app.update(Message::Flow(Flow::Recover));
+        assert_eq!(app.jobs[0].id, id);
+        assert!(!app.jobs[0].stopping);
+        let _ = app.update(Message::Page(Page::Elevate));
+        assert_eq!(app.page, Page::Discover);
+        let _ = app.update(Message::Flow(Flow::Capture));
+        assert_eq!(app.page, Page::Discover);
+        let bssid = app.survey.networks[1].bssid.clone();
+        let _ = app.update(Message::Select(bssid));
+        assert_eq!(app.recovery_capture_path, "/saved.cap");
+        assert_eq!(app.hash_path, "/saved.hc22000");
+        assert_eq!(app.recovery_bssid, "02:00:00:00:00:01");
+        let _ = app.update(Message::StopAll);
+        pump_until(&mut app, |app| app.jobs.is_empty());
+        let _ = app.update(Message::RecoveryCapturePath("/different.cap".into()));
+        assert!(app.recovery_bssid.is_empty());
+        assert!(app.recovery_networks.is_empty());
+        assert!(app.hash_path.is_empty());
+    }
+
+    #[test]
     fn navigation_requires_completion_and_step_shortcuts_only_go_back() {
         let mut app = demo_app();
         app.authorization = Authorization::Idle;
@@ -1553,15 +1768,20 @@ mod tests {
         let _ = app.update(Message::StopAndCheck);
         assert!(!app.can_advance());
         pump_until(&mut app, |app| app.jobs.is_empty());
-        assert!(app.can_advance());
+        assert!(app.can_use_capture());
         let _ = app.update(Message::Next);
-        assert_eq!(app.page, Page::Recover);
+        assert_eq!(app.page, Page::Capture);
+        assert_eq!(app.flow, Flow::Capture);
+        let _ = app.update(Message::UseCapture);
+        assert_eq!(app.flow, Flow::Recover);
         assert!(!app.can_advance());
         let _ = app.update(Message::Next);
-        assert_eq!(app.page, Page::Recover);
+        assert_eq!(app.flow, Flow::Recover);
         let _ = app.update(Message::Back);
+        assert_eq!(app.flow, Flow::Recover);
+        let _ = app.update(Message::Flow(Flow::Capture));
         assert_eq!(app.page, Page::Capture);
-        assert!(app.can_advance());
+        assert!(app.can_use_capture());
         let _ = app.update(Message::Page(Page::Discover));
         let bssid = app.survey.networks[1].bssid.clone();
         let _ = app.update(Message::Select(bssid));
@@ -1613,20 +1833,20 @@ mod tests {
         app.page = Page::Capture;
         let _ = app.update(Message::CapturePath("/first.cap".into()));
         app.capture_check = Some(Inspection::Found);
-        assert!(app.can_advance());
+        assert!(app.can_use_capture());
         let _ = app.update(Message::CapturePath("/second.cap".into()));
         assert_eq!(app.capture_check, None);
-        assert!(!app.can_advance());
+        assert!(!app.can_use_capture());
         app.capture_check = Some(Inspection::Found);
         let other = app.survey.networks[1].bssid.clone();
         let _ = app.update(Message::Select(other));
         assert_eq!(app.capture_check, None);
         assert!(app.capture_path.is_empty());
-        assert!(!app.can_advance());
+        assert!(!app.can_use_capture());
     }
 
     #[test]
-    fn recovery_requires_a_nonempty_file_and_rechecks_it_on_next() {
+    fn capture_handoff_requires_a_nonempty_file_and_rechecks_it() {
         let mut app = demo_app();
         app.demo = false; // Validate real files without starting any subprocess.
         app.page = Page::Capture;
@@ -1634,23 +1854,23 @@ mod tests {
         let capture = dir.path().join("test.cap");
         for path in [&capture, dir.path()] {
             let _ = app.update(Message::CapturePath(path.to_string_lossy().into_owned()));
-            assert!(!app.can_advance());
+            assert!(!app.can_use_capture());
         }
         fs::write(&capture, []).unwrap();
         let _ = app.update(Message::CapturePath(capture.to_string_lossy().into_owned()));
-        assert!(!app.can_advance());
+        assert!(!app.can_use_capture());
         fs::write(&capture, b"synthetic capture data").unwrap();
         let _ = app.update(Message::CapturePath(capture.to_string_lossy().into_owned()));
         assert!(
-            !app.can_advance(),
+            !app.can_use_capture(),
             "a nonempty file alone is not a handshake"
         );
         app.capture_check = Some(Inspection::NotFound);
-        assert!(!app.can_advance());
+        assert!(!app.can_use_capture());
         app.capture_check = Some(Inspection::Found);
-        assert!(app.can_advance());
+        assert!(app.can_use_capture());
         fs::write(&capture, b"changed capture data with a different size").unwrap();
-        let _ = app.update(Message::Next);
+        let _ = app.update(Message::UseCapture);
         assert_eq!(
             app.page,
             Page::Capture,
@@ -1659,18 +1879,24 @@ mod tests {
         assert_eq!(app.capture_check, None);
         app.capture_check = Some(Inspection::Found);
         fs::remove_file(&capture).unwrap();
-        let _ = app.update(Message::Next);
+        let _ = app.update(Message::UseCapture);
         assert_eq!(app.page, Page::Capture);
-        assert!(!app.can_advance());
+        assert!(!app.can_use_capture());
         fs::write(&capture, b"synthetic capture data").unwrap();
-        let _ = app.update(Message::Next);
+        let _ = app.update(Message::UseCapture);
         assert_eq!(
             app.page,
             Page::Capture,
             "a replaced file needs another check"
         );
         app.capture_check = Some(Inspection::Found);
-        let _ = app.update(Message::Next);
-        assert_eq!(app.page, Page::Recover);
+        let _ = app.update(Message::UseCapture);
+        assert_eq!(app.flow, Flow::Recover);
+        assert_eq!(app.recovery_capture_path, app.capture_path);
+        assert_eq!(app.recovery_bssid, app.target.as_ref().unwrap().bssid);
+        assert!(
+            app.jobs.is_empty(),
+            "handoff must not start recovery automatically"
+        );
     }
 }

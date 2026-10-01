@@ -83,6 +83,9 @@ pub enum Operation {
         capture: PathBuf,
         bssid: String,
     },
+    ReadCapture {
+        capture: PathBuf,
+    },
     Convert {
         capture: PathBuf,
         output: PathBuf,
@@ -133,6 +136,7 @@ impl Operation {
             Self::Capture { .. } => "Capture handshake",
             Self::Deauth { .. } => "Deauthenticate",
             Self::Inspect { .. } => "Inspect capture",
+            Self::ReadCapture { .. } => "Read saved capture",
             Self::Convert { .. } => "Convert to hc22000",
             Self::Crack {
                 pattern: Some(_), ..
@@ -269,6 +273,7 @@ impl Operation {
                 args.push(iface(interface)?);
                 (Tool::Aireplay, args, true)
             }
+            Self::ReadCapture { capture } => (Tool::Aircrack, vec![path(capture)?], false),
             Self::Inspect { capture, bssid } => {
                 mac(bssid)?;
                 // Read the network summary. Forcing WPA without a wordlist
@@ -364,7 +369,9 @@ impl Operation {
                 .map_err(|e| format!("Cannot read {}: {e}", p.display()))
         };
         match self {
-            Self::Inspect { capture, .. } | Self::Convert { capture, .. } => require(capture)?,
+            Self::Inspect { capture, .. }
+            | Self::ReadCapture { capture }
+            | Self::Convert { capture, .. } => require(capture)?,
             Self::Crack {
                 input,
                 wordlist,
