@@ -45,7 +45,7 @@ The adapter handoff does not run `airmon-ng check kill` or restart system networ
 
 ## Pattern recovery
 
-In Recover, select **Pattern / regex**, supply a source wordlist (one word per line), and enter a pattern. **Preview & count** shows sample passwords and the number of candidate combinations without expanding the entire search. **Start recovery** streams candidates directly into the selected tool. No combined dictionary file is created, and no additional external generator is required. Source loading, counting, and generation run off the UI thread; Stop cancels the generator and the tool. Capture paths, engine selection, and Hashcat conversion are in the collapsed **capture & engine settings** section below the form.
+In Recover, choose **Aircrack-ng** or **Hashcat** using the selector at the top, select **Pattern / regex**, supply a source wordlist (one word per line), and enter a pattern. **Preview & count** shows sample passwords and the number of candidate combinations without expanding the entire search. **Start recovery** streams candidates directly into the selected tool. No combined dictionary file is created, and no additional external generator is required. Source loading, counting, and generation run off the UI thread; Stop cancels the generator and the tool. Capture paths and Hashcat conversion are in the collapsed **Input file settings** section below the form.
 
 | Pattern | Candidates |
 | --- | --- |

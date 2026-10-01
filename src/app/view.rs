@@ -1179,13 +1179,16 @@ impl App {
                 )
             },
         );
-        let mut content = column![heading(
-            "Recover the password.",
-            "Try complete passwords or build candidates from a pattern."
-        )]
+        let mut content = column![
+            heading(
+                "Recover the password.",
+                "Try complete passwords or build candidates from a pattern."
+            ),
+            engine,
+        ]
         .spacing(10)
         .width(Fill);
-        let mut settings = column![engine].spacing(12).width(Fill);
+        let mut settings = column![].spacing(12).width(Fill);
         if is_hashcat {
             settings = settings
                 .push(field(
@@ -1396,11 +1399,7 @@ impl App {
             content = content.push(text("Candidates are generated on demand. No combined wordlist is saved; large combinations can still take a long time.").size(12).color(style::MUTED));
         }
         content = content.push(disclosure(
-            if is_hashcat {
-                "Hashcat · capture & engine settings"
-            } else {
-                "Aircrack-ng · capture & engine settings"
-            },
+            "Input file settings",
             self.panels.recovery_settings,
             Panel::RecoverySettings,
         ));
@@ -1415,7 +1414,7 @@ impl App {
             || (!is_hashcat && self.capture_path.is_empty())
         {
             content = content.push(
-                text("Choose an input file in capture & engine settings to begin.")
+                text("Choose a file in input file settings to begin.")
                     .size(12)
                     .color(style::MUTED),
             );
