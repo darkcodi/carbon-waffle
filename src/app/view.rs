@@ -28,7 +28,10 @@ impl App {
                             })
                             .size(14),
                         )
-                        .on_press_maybe((!self.closing).then_some(Message::Flow(flow)))
+                        .on_press_maybe(
+                            (!self.closing && self.browser.is_none() && !self.library.importing)
+                                .then_some(Message::Flow(flow)),
+                        )
                         .padding([10, 24])
                         .style(move |_, status| style::choice(selected, status)),
                     )
@@ -42,7 +45,9 @@ impl App {
         .align_y(Center)
         .spacing(5);
 
-        let screen = if self.flow == Flow::Recover {
+        let screen = if let Some(browser) = &self.browser {
+            self.file_browser(browser)
+        } else if self.flow == Flow::Recover {
             self.recover()
         } else {
             match self.page {
@@ -873,7 +878,7 @@ impl App {
         } else if !self.capture_path.is_empty() {
             (
                 "Capture file unavailable".into(),
-                "The file is missing or empty. Choose a different file below, or start a new recording.",
+                "The file is missing or empty. Start a new recording, or choose a saved capture in Recover.",
                 false,
             )
         } else {
@@ -1063,53 +1068,27 @@ impl App {
         if self.capture_running() {
             content = content.push(self.reconnect_options());
         }
-        content = content.push(disclosure(
-            if self.capture_path.is_empty() {
-                "Use an existing capture instead"
-            } else {
-                "Recording file & other options"
-            },
-            self.panels.capture_file,
-            Panel::CaptureFile,
-        ));
-        if self.panels.capture_file {
-            let discovery_running = self
-                .jobs
-                .iter()
-                .any(|job| matches!(job.operation, Operation::Scan { .. }));
-            let editor = column![
-                text("Capture file").size(12).color(style::MUTED),
-                text_input("/path/to/capture.cap", &self.capture_path)
-                    .on_input_maybe(idle.then_some(Message::CapturePath as fn(String) -> Message))
-                    .padding(13)
-                    .size(13)
-                    .style(style::input),
-                text(if idle {
-                    "Choose an existing file, then check it for the selected network."
-                } else if discovery_running {
-                    "Stop discovery to choose and check an existing capture."
-                } else {
-                    "Your recording is being saved here. File changes are available once it stops."
-                })
+        content = content.push(
+            text("Recordings are saved automatically and appear in Recover.")
                 .size(12)
                 .color(style::MUTED),
-            ]
-            .spacing(8);
-            let mut options = column![editor].spacing(14);
-            if discovery_running {
-                options = options.push(
-                    button(text("Stop discovery").size(13))
-                        .on_press(Message::StopAll)
-                        .style(style::secondary)
-                        .padding([10, 16]),
-                );
-            }
-            if idle && !self.capture_path.is_empty() {
-                options = options.push(
+        );
+        if !self.capture_path.is_empty() {
+            content = content.push(disclosure(
+                "Recording options",
+                self.panels.capture_file,
+                Panel::CaptureFile,
+            ));
+            if self.panels.capture_file {
+                content = content.push(
                     row![
-                        self.action("Check again", Action::Inspect, self.capture_available)
-                            .style(style::secondary)
-                            .width(Fill),
+                        self.action(
+                            "Check again",
+                            Action::Inspect,
+                            idle && self.capture_available
+                        )
+                        .style(style::secondary)
+                        .width(Fill),
                         self.action("New recording", Action::Capture, can_record)
                             .style(style::secondary)
                             .width(Fill),
@@ -1117,7 +1096,6 @@ impl App {
                     .spacing(12),
                 );
             }
-            content = content.push(options);
         }
         container(content).max_width(640).width(Fill).into()
     }
@@ -1176,7 +1154,107 @@ impl App {
         content.width(Fill).into()
     }
 
+    fn capture_library(&self) -> Element<'_, Message> {
+        let idle =
+            !self.offline_busy() && !self.radio_busy() && !self.closing && !self.library.importing;
+        let mut content = column![
+            heading(
+                "Your captures.",
+                "Choose a recording to recover its password. No elevation or adapter needed."
+            ),
+            row![
+                text(format!("{} saved", self.library.entries.len()))
+                    .size(13)
+                    .color(style::MUTED)
+                    .width(Fill),
+                button(
+                    text(if self.library.loading {
+                        "Refreshing…"
+                    } else {
+                        "Refresh"
+                    })
+                    .size(13)
+                )
+                .on_press_maybe(
+                    (!self.library.loading && !self.library.importing)
+                        .then_some(Message::RefreshLibrary)
+                )
+                .style(style::quiet)
+                .padding([10, 14]),
+                button(
+                    text(if self.library.importing {
+                        "Importing…"
+                    } else {
+                        "Import capture"
+                    })
+                    .size(13)
+                )
+                .on_press_maybe(
+                    (idle && !self.demo)
+                        .then_some(Message::Browse(super::browser::Purpose::Capture))
+                )
+                .style(style::secondary)
+                .padding([10, 16]),
+            ]
+            .spacing(8)
+            .align_y(Center),
+        ]
+        .spacing(12)
+        .width(Fill);
+        if let Some(error) = &self.library.error {
+            content = content.push(text(error).size(13).color(style::ERROR));
+        }
+        if self.library.entries.is_empty() && !self.library.loading {
+            content = content.push(container(column![
+                text("No captures yet").size(20).font(style::SEMIBOLD),
+                text("Make a recording in Capture, or import an existing capture or WPA hash file.").size(14).color(style::MUTED),
+                button(text("Go to Capture →").size(13)).on_press(Message::Flow(Flow::Capture)).padding([12, 18]).style(style::primary),
+            ].spacing(16)).padding(28).width(Fill).style(style::card));
+        }
+        for entry in &self.library.entries {
+            content = content.push(
+                button(
+                    row![
+                        column![
+                            text(&entry.name).size(16).font(style::SEMIBOLD),
+                            text(&entry.detail).size(12).color(style::MUTED)
+                        ]
+                        .spacing(7)
+                        .width(Fill),
+                        text("→").size(22).color(style::ACCENT),
+                    ]
+                    .spacing(16)
+                    .align_y(Center),
+                )
+                .on_press_maybe(idle.then_some(Message::ChooseCapture(entry.clone())))
+                .padding(18)
+                .width(Fill)
+                .style(style::secondary),
+            );
+        }
+        if self.radio_busy() {
+            content = content.push(
+                text("Stop the active recording or scan before choosing a capture.")
+                    .size(12)
+                    .color(style::MUTED),
+            );
+        }
+        content = content.push(
+            text("New recordings are saved in ~/.carbon-waffle/captures/")
+                .size(12)
+                .color(style::MUTED),
+        );
+        if let Some(error) = &self.save_error {
+            content = content.push(text(error).size(12).color(style::ERROR));
+        }
+        container(content).max_width(700).width(Fill).into()
+    }
+
     fn recover(&self) -> Element<'_, Message> {
+        if self.library.show || (self.recovery_capture_path.is_empty() && self.hash_path.is_empty())
+        {
+            return self.capture_library();
+        }
         let offline = self.jobs.iter().find(|job| {
             matches!(
                 job.operation,
@@ -1210,112 +1288,121 @@ impl App {
                         .size(13)
                         .align_x(Center),
                     )
-                    .on_press_maybe(idle.then_some(Message::Engine(engine)))
+                    .on_press_maybe(
+                        (idle
+                            && (engine == Engine::Hashcat
+                                || !self.recovery_capture_path.is_empty()))
+                        .then_some(Message::Engine(engine)),
+                    )
                     .padding([12, 18])
                     .width(Fill)
                     .style(move |_, status| style::choice(selected, status)),
                 )
             },
         );
+        let selected_path = if self.recovery_capture_path.is_empty() {
+            &self.hash_path
+        } else {
+            &self.recovery_capture_path
+        };
+        let name = self
+            .library
+            .entries
+            .iter()
+            .find(|entry| entry.path == std::path::Path::new(selected_path))
+            .map(|entry| entry.name.clone())
+            .unwrap_or_else(|| {
+                std::path::Path::new(selected_path)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            });
         let mut content = column![
             heading(
                 "Recover the password.",
-                "Open a saved capture or hash file. No elevation or Wi-Fi adapter needed."
+                "Choose a wordlist or describe the password pattern, then start recovery."
             ),
+            container(
+                row![
+                    column![
+                        text("Selected capture").size(11).color(style::MUTED),
+                        text(name).size(16).font(style::SEMIBOLD)
+                    ]
+                    .spacing(5)
+                    .width(Fill),
+                    button(text("Change").size(13))
+                        .on_press_maybe(idle.then_some(Message::ShowLibrary))
+                        .padding([10, 14])
+                        .style(style::secondary),
+                ]
+                .spacing(12)
+                .align_y(Center)
+            )
+            .padding(14)
+            .width(Fill)
+            .style(style::card),
             engine,
         ]
-        .spacing(8)
+        .spacing(10)
         .width(Fill);
         if is_hashcat {
-            content = content
-                .push(field(
-                    "Hash file",
-                    "/path/to/handshake.hc22000",
-                    &self.hash_path,
-                    Message::HashPath,
-                ))
-                .push(disclosure(
-                    "Convert a capture for Hashcat",
-                    self.panels.conversion,
-                    Panel::Conversion,
-                ));
-            if self.panels.conversion {
+            if self.hash_path.is_empty() && idle {
                 content = content.push(
-                    container(
-                        column![
-                            field(
-                                "Capture file",
-                                "/path/to/capture.cap",
-                                &self.recovery_capture_path,
-                                Message::RecoveryCapturePath
-                            ),
-                            self.action(
-                                "Convert capture",
-                                Action::Convert,
-                                idle && !self.recovery_capture_path.is_empty()
-                            )
-                            .style(style::secondary)
-                            .width(Fill),
-                        ]
-                        .spacing(12),
+                    self.action(
+                        "Prepare capture for Hashcat",
+                        Action::Convert,
+                        !self.recovery_capture_path.is_empty(),
                     )
-                    .padding(18)
-                    .width(Fill)
-                    .style(style::card),
+                    .style(style::secondary)
+                    .width(Fill),
+                );
+            }
+        } else if self.recovery_networks.is_empty() {
+            if !self.recovery_bssid.is_empty() {
+                content = content.push(
+                    text(format!("Network · {}", self.recovery_bssid))
+                        .size(12)
+                        .color(style::MUTED),
+                );
+            } else if idle {
+                content = content.push(
+                    self.action("Read networks in capture", Action::ReadCapture, true)
+                        .style(style::secondary)
+                        .width(Fill),
                 );
             }
         } else {
-            content = content.push(
-                row![
-                    container(field(
-                        "Capture file",
-                        "/path/to/capture.cap",
-                        &self.recovery_capture_path,
-                        Message::RecoveryCapturePath
-                    ))
-                    .width(Fill),
-                    self.action(
-                        "Read capture",
-                        Action::ReadCapture,
-                        idle && !self.recovery_capture_path.trim().is_empty()
-                    )
-                    .style(style::secondary)
-                    .padding([12, 14]),
-                ]
-                .spacing(10)
-                .align_y(iced::Bottom),
-            );
-            if self.recovery_networks.is_empty() {
-                content = content.push(field(
-                    "Network BSSID · read the capture to fill this",
-                    "AA:BB:CC:DD:EE:FF",
-                    &self.recovery_bssid,
-                    Message::RecoveryBssid,
-                ));
-            } else {
-                let selected = self
-                    .recovery_networks
-                    .iter()
-                    .find(|network| network.bssid.eq_ignore_ascii_case(&self.recovery_bssid));
+            let selected = self
+                .recovery_networks
+                .iter()
+                .find(|network| network.bssid.eq_ignore_ascii_case(&self.recovery_bssid));
+            if self.recovery_networks.len() == 1 {
                 content = content.push(
-                    column![
-                        text("Network in this capture").size(12).color(style::MUTED),
-                        pick_list(
-                            self.recovery_networks.as_slice(),
-                            selected,
-                            Message::RecoveryNetwork
-                        )
-                        .placeholder("Choose a network")
-                        .padding(12)
-                        .text_size(13)
-                        .style(style::select)
-                        .width(Fill),
-                    ]
-                    .spacing(8),
+                    text(self.recovery_networks[0].to_string())
+                        .size(12)
+                        .color(style::MUTED),
                 );
-                if selected.is_some_and(|network| network.handshakes == 0) {
-                    content = content.push(text("No handshake found for this network. Choose another network or capture file.").size(12).color(style::ERROR));
-                }
+            } else {
+                content = content.push(
+                    pick_list(
+                        self.recovery_networks.as_slice(),
+                        selected,
+                        Message::RecoveryNetwork,
+                    )
+                    .placeholder("Choose a network")
+                    .padding(12)
+                    .text_size(13)
+                    .style(style::select)
+                    .width(Fill),
+                );
+            }
+            if selected.is_some_and(|network| network.handshakes == 0) {
+                content = content.push(
+                    text("No handshake found for this network. Choose another network or capture.")
+                        .size(12)
+                        .color(style::ERROR),
+                );
             }
         }
         let modes = [RecoveryMode::Dictionary, RecoveryMode::Pattern]
@@ -1350,11 +1437,36 @@ impl App {
                     })
                     .size(12)
                     .color(style::MUTED),
-                    text_input("/path/to/wordlist.txt", &self.wordlist)
-                        .on_input_maybe(idle.then_some(Message::Wordlist as fn(String) -> Message))
-                        .padding(12)
-                        .size(14)
-                        .style(style::input),
+                    button(
+                        row![
+                            text(if self.wordlist.is_empty() {
+                                "Choose a wordlist…".into()
+                            } else {
+                                std::path::Path::new(&self.wordlist)
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .into_owned()
+                            })
+                            .size(14)
+                            .width(Fill),
+                            text(if self.wordlist.is_empty() {
+                                "Browse"
+                            } else {
+                                "Change"
+                            })
+                            .size(12)
+                            .color(style::MUTED),
+                        ]
+                        .spacing(10)
+                        .align_y(Center)
+                    )
+                    .on_press_maybe(
+                        idle.then_some(Message::Browse(super::browser::Purpose::Wordlist))
+                    )
+                    .width(Fill)
+                    .padding(12)
+                    .style(style::secondary),
                 ]
                 .spacing(8),
             );

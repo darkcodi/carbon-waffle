@@ -175,6 +175,8 @@ fn recover_previews() {
     fs::create_dir_all(&directory).unwrap();
     for name in [
         "empty",
+        "library",
+        "browser",
         "loaded",
         "dictionary",
         "pattern",
@@ -186,6 +188,7 @@ fn recover_previews() {
     ] {
         let mut app = App::new(true);
         app.flow = Flow::Recover;
+        app.library.show = matches!(name, "empty" | "library");
         app.recovery_capture_path = "/home/researcher/captures/capture-4-01.cap".into();
         app.recovery_bssid = "02:00:00:00:00:01".into();
         app.hash_path = "/home/researcher/captures/handshake.hc22000".into();
@@ -195,10 +198,41 @@ fn recover_previews() {
         app.interfaces.clear();
         app.authorization = Authorization::Idle;
         app.status = "Ready to recover the password.".into();
+        app.library.entries[0].path = app.recovery_capture_path.clone().into();
+        if name == "library" {
+            let sample = app.library.entries[0].clone();
+            app.library.entries = (0..5)
+                .map(|i| library::Entry {
+                    path: PathBuf::from(format!("/synthetic/capture-{i}.cap")),
+                    name: format!("Research Wi-Fi {}", i + 1),
+                    detail: format!("02:00:00:00:00:0{i} · {} hours ago · 128 KiB", i + 1),
+                    ..sample.clone()
+                })
+                .collect();
+        }
+        if name == "browser" {
+            app.browser = Some(browser::Browser {
+                purpose: browser::Purpose::Wordlist,
+                directory: "/home/researcher/wordlists".into(),
+                files: ["words.txt", "research-passwords.txt"]
+                    .into_iter()
+                    .map(|name| browser::File {
+                        path: PathBuf::from("/synthetic").join(name),
+                        name: name.into(),
+                        directory: false,
+                    })
+                    .collect(),
+                hidden: false,
+                filter: String::new(),
+                loading: false,
+                error: None,
+            });
+        }
         if !matches!(name, "dictionary" | "empty") {
             let _ = app.update(Message::RecoveryMode(RecoveryMode::Pattern));
         }
         if name == "empty" {
+            app.library.entries.clear();
             app.recovery_capture_path.clear();
             app.recovery_bssid.clear();
             app.hash_path.clear();
