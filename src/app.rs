@@ -2,7 +2,8 @@ use crate::{
     command::{Engine, Operation, Tool, find_tool},
     model::{self, Interface, Network, Survey, absolute_path},
     monitor::NetworkRestore,
-    runner::{Authorization, Event, Job, Runner},
+    pattern::{self, Pattern},
+    runner::{Authorization, Event, Inspection, Job, Runner},
 };
 use iced::{Subscription, Task};
 use std::{
@@ -10,7 +11,11 @@ use std::{
     fs,
     os::unix::fs::DirBuilderExt,
     path::PathBuf,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 mod appearance;
@@ -67,6 +72,8 @@ pub enum Panel {
     CaptureFile,
     Conversion,
     Session,
+    PatternHelp,
+    RecoverySettings,
 }
 
 #[derive(Default)]
@@ -78,6 +85,14 @@ struct Panels {
     capture_file: bool,
     conversion: bool,
     session: bool,
+    pattern_help: bool,
+    recovery_settings: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryMode {
+    Dictionary,
+    Pattern,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -110,8 +125,13 @@ pub enum Message {
     CapturePath(String),
     HashPath(String),
     Wordlist(String),
+    RecoveryMode(RecoveryMode),
+    Pattern(String),
+    PreviewPattern,
+    PatternPreview(u64, Result<pattern::Preview, String>),
     Engine(Engine),
     Run(Action),
+    StopAndCheck,
     Stop(u64),
     StopAll,
     ClearActivity,
@@ -159,8 +179,19 @@ pub struct App {
     count: String,
     capture_path: String,
     capture_available: bool,
+    capture_stamp: Option<(u64, SystemTime)>,
+    capture_check: Option<Inspection>,
+    check_after_capture: bool,
+    capture_started: Option<Instant>,
     hash_path: String,
     wordlist: String,
+    recovery_mode: RecoveryMode,
+    pattern: String,
+    pattern_check: Result<Pattern, String>,
+    pattern_preview: Option<Result<pattern::Preview, String>>,
+    preview_revision: u64,
+    preview_cancel: Option<Arc<AtomicBool>>,
+    candidate_progress: Option<(u64, String)>,
     engine: Engine,
     tools: Vec<(Tool, bool)>,
     runner: Runner,
@@ -212,8 +243,19 @@ impl App {
             count: "5".into(),
             capture_path: String::new(),
             capture_available: false,
+            capture_stamp: None,
+            capture_check: None,
+            check_after_capture: false,
+            capture_started: None,
             hash_path: String::new(),
             wordlist: String::new(),
+            recovery_mode: RecoveryMode::Dictionary,
+            pattern: "{Word}{Word}[0-9]{3}".into(),
+            pattern_check: Pattern::parse("{Word}{Word}[0-9]{3}"),
+            pattern_preview: None,
+            preview_revision: 0,
+            preview_cancel: None,
+            candidate_progress: None,
             engine: Engine::Aircrack,
             tools: Tool::ALL
                 .into_iter()
@@ -347,6 +389,7 @@ impl App {
             Page::Capture => {
                 self.target.is_some()
                     && self.capture_available
+                    && self.capture_check == Some(Inspection::Found)
                     && !self.radio_busy()
                     && !self.offline_busy()
             }
@@ -367,11 +410,26 @@ impl App {
         self.capture_available = if self.demo {
             !self.capture_path.trim().is_empty()
         } else {
-            absolute_path(&self.capture_path)
+            let stamp = absolute_path(&self.capture_path)
                 .ok()
                 .and_then(|path| fs::metadata(path).ok())
-                .is_some_and(|metadata| metadata.is_file() && metadata.len() > 0)
+                .filter(|metadata| metadata.is_file() && metadata.len() > 0)
+                .and_then(|metadata| Some((metadata.len(), metadata.modified().ok()?)));
+            if self.capture_stamp != stamp {
+                self.capture_check = None;
+            }
+            self.capture_stamp = stamp;
+            stamp.is_some()
         };
+        if !self.capture_available {
+            self.capture_check = None;
+        }
+    }
+
+    fn inspection_matches(&self, operation: &Operation) -> bool {
+        matches!(operation, Operation::Inspect { capture, bssid }
+            if absolute_path(&self.capture_path).as_ref().ok() == Some(capture)
+                && self.target.as_ref().is_some_and(|target| target.bssid.eq_ignore_ascii_case(bssid)))
     }
 
     fn launch(&mut self, operation: Operation) {
@@ -406,10 +464,10 @@ impl App {
             .start(self.next_id, operation.clone(), self.demo)
         {
             Ok(job) => {
-                self.status_error = false;
-                if matches!(operation, Operation::Inspect { .. }) {
-                    self.panels.activity = true;
+                if matches!(operation, Operation::Crack { .. }) {
+                    self.candidate_progress = None;
                 }
+                self.status_error = false;
                 self.status = format!(
                     "{}{}",
                     operation.label(),
@@ -422,6 +480,8 @@ impl App {
                 if let Operation::Capture { prefix, .. } = &operation {
                     self.capture_path = format!("{}-01.cap", prefix.display());
                     self.capture_available = false;
+                    self.capture_check = None;
+                    self.capture_started = None;
                     self.hash_path.clear();
                 }
                 self.jobs.push(job);
@@ -531,8 +591,17 @@ impl App {
             }),
             Action::Crack => {
                 if self.engine == Engine::Aircrack && !target()?.supports_dictionary() {
-                    return Err("This workflow supports WPA/WPA2 PSK dictionary recovery. Select a PSK network.".into());
+                    return Err(
+                        "This workflow supports WPA/WPA2 PSK recovery. Select a PSK network."
+                            .into(),
+                    );
                 }
+                let pattern =
+                    (self.recovery_mode == RecoveryMode::Pattern).then(|| self.pattern.clone());
+                let needs_words = match &pattern {
+                    Some(source) => Pattern::parse(source)?.needs_words(),
+                    None => true,
+                };
                 Ok(Operation::Crack {
                     engine: self.engine,
                     input: absolute_path(if self.engine == Engine::Aircrack {
@@ -540,7 +609,12 @@ impl App {
                     } else {
                         &self.hash_path
                     })?,
-                    wordlist: absolute_path(&self.wordlist)?,
+                    wordlist: if needs_words {
+                        absolute_path(&self.wordlist)?
+                    } else {
+                        PathBuf::new()
+                    },
+                    pattern,
                     bssid: self
                         .target
                         .as_ref()
@@ -587,6 +661,10 @@ impl App {
             self.fail("Stop the active radio job first.".into());
             return;
         }
+        if matches!(action, Action::Capture) && self.offline_busy() {
+            self.fail("Wait for the current file check or recovery job to finish.".into());
+            return;
+        }
         if matches!(action, Action::Inspect | Action::Convert | Action::Crack)
             && (self.offline_busy() || self.radio_busy())
         {
@@ -600,6 +678,12 @@ impl App {
                 .any(|j| matches!(j.operation, Operation::Deauth { .. }))
         {
             return;
+        }
+        if matches!(action, Action::Inspect) {
+            self.capture_check = None;
+        }
+        if matches!(action, Action::Crack) {
+            self.invalidate_preview();
         }
         let operation = match self.operation(action) {
             Ok(op) => op,
@@ -720,9 +804,31 @@ impl App {
                     }
                 }
             }
-            Operation::Capture { .. } | Operation::Inspect { .. } => {
+            Operation::Capture { .. } => {
                 if !self.demo || ok || cancelled {
                     self.refresh_capture_available();
+                }
+            }
+            Operation::Inspect { .. } if self.inspection_matches(&job.operation) => {
+                self.refresh_capture_available();
+                if error.is_some() || self.capture_check.is_none() {
+                    self.capture_check = Some(Inspection::Unknown);
+                }
+                self.status_error = self.capture_check == Some(Inspection::Unknown);
+                self.status = match self.capture_check {
+                    Some(Inspection::Found) if self.demo => "Demo check complete · simulated handshake.".into(),
+                    Some(Inspection::Found) => "Handshake found. Choose Next to open Recover.".into(),
+                    Some(Inspection::NotFound) => "No handshake found yet. Record again while a device reconnects.".into(),
+                    _ => "Could not verify this capture. See Activity for details, then retry the check.".into(),
+                };
+                if self.status_error && !cancelled {
+                    self.panels.activity = true;
+                }
+                if cancelled {
+                    self.capture_check = None;
+                    self.status_error = false;
+                    self.status =
+                        "Check cancelled. Choose Check handshake when you’re ready.".into();
                 }
             }
             Operation::Convert { output, .. } if ok => {
@@ -753,6 +859,14 @@ impl App {
         } else {
             self.log(id, self.status.clone());
         }
+    }
+
+    fn invalidate_preview(&mut self) {
+        if let Some(cancel) = self.preview_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.preview_revision += 1;
+        self.pattern_preview = None;
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -793,11 +907,8 @@ impl App {
                 self.authorization = authorization;
             }
             Message::Tick => {
-                if self.page == Page::Monitoring
-                    && self
-                        .jobs
-                        .iter()
-                        .any(|job| matches!(job.operation, Operation::Monitor { .. }))
+                if (self.page == Page::Monitoring || self.page == Page::Capture)
+                    && (!self.jobs.is_empty() || self.pending.is_some())
                 {
                     self.spinner_frame = (self.spinner_frame + 1) % 8;
                 }
@@ -807,9 +918,35 @@ impl App {
                         Event::Started => {
                             if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
                                 job.started = true;
+                                if matches!(job.operation, Operation::Capture { .. }) {
+                                    self.capture_started = Some(Instant::now());
+                                }
                             }
                         }
                         Event::Line(line) => self.log(id, line),
+                        Event::Inspection(result) => {
+                            if self
+                                .jobs
+                                .iter()
+                                .any(|job| job.id == id && self.inspection_matches(&job.operation))
+                            {
+                                self.capture_check = Some(result);
+                            }
+                        }
+                        Event::Candidates { generated, total } => {
+                            if self.jobs.iter().any(|job| {
+                                job.id == id
+                                    && matches!(
+                                        job.operation,
+                                        Operation::Crack {
+                                            pattern: Some(_),
+                                            ..
+                                        }
+                                    )
+                            }) {
+                                self.candidate_progress = Some((generated, total));
+                            }
+                        }
                         Event::NetworkRestore(restore) => self.network_restore = restore,
                         Event::MonitorReady(interface) => {
                             self.owned_monitor = Some(interface.clone());
@@ -834,6 +971,18 @@ impl App {
                     && let Some(operation) = self.pending.take()
                 {
                     self.launch(operation);
+                }
+                if self.check_after_capture && !self.radio_busy() && !self.offline_busy() {
+                    self.check_after_capture = false;
+                    self.refresh_capture_available();
+                    if !self.closing && self.authorization == Authorization::Ready {
+                        if self.capture_available {
+                            self.run(Action::Inspect);
+                        } else {
+                            self.capture_check = Some(Inspection::Unknown);
+                            self.fail("No capture data was saved. Start recording again.".into());
+                        }
+                    }
                 }
                 if self.closing && self.jobs.is_empty() {
                     if self.owned_monitor.is_some() || self.network_restore.is_some() {
@@ -889,6 +1038,8 @@ impl App {
                     {
                         self.capture_path.clear();
                         self.capture_available = false;
+                        self.capture_check = None;
+                        self.capture_started = None;
                         self.hash_path.clear();
                     }
                     self.target = Some(network.clone());
@@ -904,14 +1055,109 @@ impl App {
             Message::Station(value) => self.station = value,
             Message::Count(value) => self.count = value,
             Message::CapturePath(value) => {
-                self.capture_path = value;
-                self.refresh_capture_available();
+                if !self.radio_busy() && !self.offline_busy() && self.pending.is_none() {
+                    self.capture_path = value;
+                    self.capture_check = None;
+                    self.refresh_capture_available();
+                }
             }
             Message::HashPath(value) => self.hash_path = value,
-            Message::Wordlist(value) => self.wordlist = value,
+            Message::Wordlist(value) => {
+                if !self.offline_busy() {
+                    self.wordlist = value;
+                    self.invalidate_preview();
+                }
+            }
+            Message::RecoveryMode(mode) => {
+                if !self.offline_busy() {
+                    self.recovery_mode = mode;
+                    self.invalidate_preview();
+                    self.candidate_progress = None;
+                }
+            }
+            Message::Pattern(value) => {
+                if !self.offline_busy() {
+                    self.pattern_check = Pattern::parse(&value);
+                    self.pattern = value;
+                    self.invalidate_preview();
+                }
+            }
+            Message::PreviewPattern => {
+                if self.offline_busy() || self.preview_cancel.is_some() || self.closing {
+                    return Task::none();
+                }
+                let pattern = match &self.pattern_check {
+                    Ok(pattern) => pattern.clone(),
+                    Err(error) => {
+                        self.pattern_preview = Some(Err(error.clone()));
+                        return Task::none();
+                    }
+                };
+                let path = if pattern.needs_words() {
+                    match absolute_path(&self.wordlist) {
+                        Ok(path) => path,
+                        Err(error) => {
+                            self.pattern_preview = Some(Err(error));
+                            return Task::none();
+                        }
+                    }
+                } else {
+                    PathBuf::new()
+                };
+                self.invalidate_preview();
+                let revision = self.preview_revision;
+                let cancel = Arc::new(AtomicBool::new(false));
+                self.preview_cancel = Some(cancel.clone());
+                let (sender, receiver) = iced::futures::channel::oneshot::channel();
+                std::thread::spawn(move || {
+                    let result = pattern
+                        .prepare(&path, &cancel)
+                        .and_then(|prepared| prepared.preview(&cancel));
+                    let _ = sender.send(result);
+                });
+                return Task::perform(
+                    async move {
+                        receiver
+                            .await
+                            .unwrap_or_else(|_| Err("Pattern preview was interrupted.".into()))
+                    },
+                    move |result| Message::PatternPreview(revision, result),
+                );
+            }
+            Message::PatternPreview(revision, result) => {
+                if revision == self.preview_revision && !self.closing {
+                    self.preview_cancel = None;
+                    self.pattern_preview = Some(result);
+                    if self.page == Page::Recover {
+                        return iced::widget::operation::scroll_to(
+                            "current-step",
+                            iced::widget::operation::AbsoluteOffset { x: 0.0, y: 240.0 },
+                        );
+                    }
+                }
+            }
             Message::Engine(value) => self.engine = value,
             Message::Run(action) => self.run(action),
+            Message::StopAndCheck => {
+                if self.capture_running()
+                    && !self.offline_busy()
+                    && !self.closing
+                    && self.authorization == Authorization::Ready
+                {
+                    self.check_after_capture = true;
+                    for job in &mut self.jobs {
+                        if matches!(
+                            job.operation,
+                            Operation::Capture { .. } | Operation::Deauth { .. }
+                        ) {
+                            job.stop();
+                        }
+                    }
+                    self.status = "Saving the recording before checking for a handshake…".into();
+                }
+            }
             Message::Stop(id) => {
+                self.check_after_capture = false;
                 let is_capture = self
                     .jobs
                     .iter()
@@ -926,6 +1172,7 @@ impl App {
                 self.pending = None;
             }
             Message::StopAll => {
+                self.check_after_capture = false;
                 self.pending = None;
                 for job in &mut self.jobs {
                     job.stop();
@@ -951,10 +1198,14 @@ impl App {
                     Panel::CaptureFile => &mut self.panels.capture_file,
                     Panel::Conversion => &mut self.panels.conversion,
                     Panel::Session => &mut self.panels.session,
+                    Panel::PatternHelp => &mut self.panels.pattern_help,
+                    Panel::RecoverySettings => &mut self.panels.recovery_settings,
                 };
                 *open = !*open;
             }
             Message::Close => {
+                self.invalidate_preview();
+                self.check_after_capture = false;
                 self.closing = true;
                 self.pending = None;
                 for job in &mut self.jobs {
@@ -970,7 +1221,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{thread, time::Instant};
+    use std::{path::Path, thread, time::Instant};
 
     fn demo_app() -> App {
         let mut app = App::new(true);
@@ -991,6 +1242,97 @@ mod tests {
             let _ = app.update(Message::Tick);
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn recovery_modes_keep_dictionary_and_pattern_inputs_separate() {
+        let mut app = demo_app();
+        app.capture_path = "/synthetic.cap".into();
+        app.wordlist = "/words.txt".into();
+        assert!(matches!(
+            app.operation(Action::Crack).unwrap(),
+            Operation::Crack { pattern: None, .. }
+        ));
+        let _ = app.update(Message::RecoveryMode(RecoveryMode::Pattern));
+        let _ = app.update(Message::Pattern("{word}{5}".into()));
+        assert!(
+            matches!(app.operation(Action::Crack).unwrap(), Operation::Crack { pattern: Some(source), wordlist, .. } if source == "{word}{5}" && wordlist == Path::new("/words.txt"))
+        );
+        let _ = app.update(Message::Wordlist(String::new()));
+        assert!(app.operation(Action::Crack).is_err());
+        let _ = app.update(Message::Pattern("[0-9]{8}".into()));
+        assert!(
+            matches!(app.operation(Action::Crack).unwrap(), Operation::Crack { wordlist, .. } if wordlist.as_os_str().is_empty())
+        );
+        let _ = app.update(Message::Pattern("[0-9]+".into()));
+        assert!(app.pattern_check.is_err());
+        assert!(app.operation(Action::Crack).is_err());
+        let _ = app.update(Message::RecoveryMode(RecoveryMode::Dictionary));
+        let _ = app.update(Message::Wordlist("/words.txt".into()));
+        assert!(matches!(
+            app.operation(Action::Crack).unwrap(),
+            Operation::Crack { pattern: None, .. }
+        ));
+    }
+
+    #[test]
+    fn edits_cancel_preview_and_ignore_late_results() {
+        let mut app = demo_app();
+        let _ = app.update(Message::RecoveryMode(RecoveryMode::Pattern));
+        let old_revision = app.preview_revision;
+        let flag = Arc::new(AtomicBool::new(false));
+        app.preview_cancel = Some(flag.clone());
+        let _ = app.update(Message::Pattern("[0-9]{8}".into()));
+        assert!(flag.load(Ordering::Relaxed));
+        assert!(app.preview_cancel.is_none());
+        let _ = app.update(Message::PatternPreview(old_revision, Err("stale".into())));
+        assert!(app.pattern_preview.is_none());
+        let _ = app.update(Message::PatternPreview(
+            app.preview_revision,
+            Err("current".into()),
+        ));
+        assert!(matches!(&app.pattern_preview, Some(Err(error)) if error == "current"));
+        let _ = app.update(Message::Wordlist("/changed.txt".into()));
+        assert!(app.pattern_preview.is_none());
+        let old_revision = app.preview_revision;
+        let _ = app.update(Message::Close);
+        let _ = app.update(Message::PatternPreview(
+            old_revision,
+            Err("after close".into()),
+        ));
+        assert!(app.pattern_preview.is_none());
+    }
+
+    #[test]
+    fn preview_completes_as_a_task_without_starting_a_tool() {
+        use iced::futures::{FutureExt, StreamExt};
+        let mut app = demo_app();
+        let directory = tempfile::tempdir().unwrap();
+        let words = directory.path().join("words.txt");
+        fs::write(&words, b"alpha\nbeta\n").unwrap();
+        let _ = app.update(Message::RecoveryMode(RecoveryMode::Pattern));
+        let _ = app.update(Message::Wordlist(words.to_string_lossy().into_owned()));
+        let task = app.update(Message::PreviewPattern);
+        assert!(app.preview_cancel.is_some());
+        assert!(app.pattern_preview.is_none());
+        assert!(app.jobs.is_empty());
+        let mut stream = iced_runtime::task::into_stream(task).unwrap();
+        let started = Instant::now();
+        loop {
+            if let Some(Some(iced_runtime::Action::Output(message))) = stream.next().now_or_never()
+            {
+                let _ = app.update(message);
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5));
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.preview_cancel.is_none());
+        let preview = app.pattern_preview.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(preview.total, 4_000);
+        assert_eq!(preview.samples[0], "AlphaAlpha000");
+        assert!(app.activity.is_empty());
+        assert!(app.jobs.is_empty());
     }
 
     #[test]
@@ -1208,7 +1550,7 @@ mod tests {
         assert!(!app.capture_path.is_empty());
         let _ = app.update(Message::Next);
         assert_eq!(app.page, Page::Capture);
-        let _ = app.update(Message::StopAll);
+        let _ = app.update(Message::StopAndCheck);
         assert!(!app.can_advance());
         pump_until(&mut app, |app| app.jobs.is_empty());
         assert!(app.can_advance());
@@ -1230,6 +1572,60 @@ mod tests {
     }
 
     #[test]
+    fn stop_and_check_waits_for_radio_shutdown_and_can_be_cancelled() {
+        let mut app = demo_app();
+        app.page = Page::Capture;
+        app.run(Action::Capture);
+        pump_until(&mut app, App::capture_running);
+        assert_eq!(
+            app.jobs.len(),
+            1,
+            "recording never sends disconnect requests automatically"
+        );
+        app.run(Action::Deauth);
+        let _ = app.update(Message::StopAndCheck);
+        assert!(app.check_after_capture);
+        assert!(app.jobs.iter().all(|job| job.stopping));
+        pump_until(&mut app, |app| {
+            app.jobs
+                .iter()
+                .any(|job| matches!(job.operation, Operation::Inspect { .. }))
+        });
+        assert!(!app.radio_busy());
+        assert!(!app.can_advance());
+        assert!(!app.check_after_capture);
+        let path = app.capture_path.clone();
+        let _ = app.update(Message::CapturePath("/different.cap".into()));
+        assert_eq!(
+            app.capture_path, path,
+            "files cannot change during inspection"
+        );
+        let _ = app.update(Message::StopAll);
+        pump_until(&mut app, |app| app.jobs.is_empty());
+        assert_eq!(app.capture_check, None);
+        assert!(!app.can_advance());
+        assert!(!app.status_error);
+    }
+
+    #[test]
+    fn successful_checks_are_invalidated_by_file_or_target_changes() {
+        let mut app = demo_app();
+        app.page = Page::Capture;
+        let _ = app.update(Message::CapturePath("/first.cap".into()));
+        app.capture_check = Some(Inspection::Found);
+        assert!(app.can_advance());
+        let _ = app.update(Message::CapturePath("/second.cap".into()));
+        assert_eq!(app.capture_check, None);
+        assert!(!app.can_advance());
+        app.capture_check = Some(Inspection::Found);
+        let other = app.survey.networks[1].bssid.clone();
+        let _ = app.update(Message::Select(other));
+        assert_eq!(app.capture_check, None);
+        assert!(app.capture_path.is_empty());
+        assert!(!app.can_advance());
+    }
+
+    #[test]
     fn recovery_requires_a_nonempty_file_and_rechecks_it_on_next() {
         let mut app = demo_app();
         app.demo = false; // Validate real files without starting any subprocess.
@@ -1245,12 +1641,35 @@ mod tests {
         assert!(!app.can_advance());
         fs::write(&capture, b"synthetic capture data").unwrap();
         let _ = app.update(Message::CapturePath(capture.to_string_lossy().into_owned()));
+        assert!(
+            !app.can_advance(),
+            "a nonempty file alone is not a handshake"
+        );
+        app.capture_check = Some(Inspection::NotFound);
+        assert!(!app.can_advance());
+        app.capture_check = Some(Inspection::Found);
         assert!(app.can_advance());
+        fs::write(&capture, b"changed capture data with a different size").unwrap();
+        let _ = app.update(Message::Next);
+        assert_eq!(
+            app.page,
+            Page::Capture,
+            "changed data invalidates the previous check"
+        );
+        assert_eq!(app.capture_check, None);
+        app.capture_check = Some(Inspection::Found);
         fs::remove_file(&capture).unwrap();
         let _ = app.update(Message::Next);
         assert_eq!(app.page, Page::Capture);
         assert!(!app.can_advance());
         fs::write(&capture, b"synthetic capture data").unwrap();
+        let _ = app.update(Message::Next);
+        assert_eq!(
+            app.page,
+            Page::Capture,
+            "a replaced file needs another check"
+        );
+        app.capture_check = Some(Inspection::Found);
         let _ = app.update(Message::Next);
         assert_eq!(app.page, Page::Recover);
     }

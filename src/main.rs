@@ -2,6 +2,7 @@ mod app;
 mod command;
 mod model;
 mod monitor;
+mod pattern;
 mod runner;
 
 fn main() -> iced::Result {

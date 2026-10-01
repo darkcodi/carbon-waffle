@@ -116,3 +116,159 @@ fn scroll_rendering() {
         );
     }
 }
+
+#[test]
+#[ignore = "manual Capture screen previews; writes software-rendered PPM files under target/capture-previews"]
+fn capture_previews() {
+    let directory = PathBuf::from("target/capture-previews");
+    fs::create_dir_all(&directory).unwrap();
+    for (name, state) in [
+        ("ready", None),
+        ("recording", None),
+        ("checking", None),
+        ("found", Some(Inspection::Found)),
+        ("missing", Some(Inspection::NotFound)),
+        ("error", Some(Inspection::Unknown)),
+        ("options", None),
+    ] {
+        let mut app = App::new(true);
+        app.page = Page::Capture;
+        app.interface.as_mut().unwrap().monitor = true;
+        app.load_demo();
+        app.target.as_mut().unwrap().ssid = "Research Wi-Fi".into();
+        app.status = "Select Start recording to begin.".into();
+        if name != "ready" {
+            app.capture_path = "/home/researcher/captures/session/capture-4-01.cap".into();
+            app.capture_available = true;
+        }
+        if name == "recording" || name == "options" {
+            let operation = app.operation(Action::Capture).unwrap();
+            let mut job = app.runner.start(1, operation, true).unwrap();
+            job.started = true;
+            app.jobs.push(job);
+            app.capture_started = Some(Instant::now() - Duration::from_secs(65));
+            app.status = "Recording traffic from the selected network.".into();
+            app.panels.reconnect = name == "options";
+        } else if name == "checking" {
+            let operation = app.operation(Action::Inspect).unwrap();
+            app.jobs.push(app.runner.start(1, operation, true).unwrap());
+            app.status = "Checking the saved recording.".into();
+        }
+        app.capture_check = state;
+        // Render real-mode copy using only synthetic data and demo jobs.
+        app.demo = false;
+        for (width, height) in [(900, 680), (1120, 850)] {
+            render_preview(
+                &app,
+                &directory.join(format!("{name}-{width}.ppm")),
+                width,
+                height,
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "manual Recover previews; writes software-rendered PPM files under target/recover-previews"]
+fn recover_previews() {
+    let directory = PathBuf::from("target/recover-previews");
+    fs::create_dir_all(&directory).unwrap();
+    for name in [
+        "dictionary",
+        "pattern",
+        "preview",
+        "syntax",
+        "invalid",
+        "running",
+        "hashcat",
+    ] {
+        let mut app = App::new(true);
+        app.page = Page::Recover;
+        app.capture_path = "/home/researcher/captures/capture-4-01.cap".into();
+        app.hash_path = "/home/researcher/captures/handshake.hc22000".into();
+        app.wordlist = "/home/researcher/wordlists/words.txt".into();
+        app.target.as_mut().unwrap().ssid = "Research Wi-Fi".into();
+        app.status = "Ready to recover the password.".into();
+        if name != "dictionary" {
+            let _ = app.update(Message::RecoveryMode(RecoveryMode::Pattern));
+        }
+        if name == "preview" {
+            app.pattern_preview = Some(Ok(pattern::Preview {
+                total: 4_000,
+                words: 2,
+                samples: vec![
+                    "AlphaAlpha000".into(),
+                    "AlphaAlpha001".into(),
+                    "AlphaAlpha002".into(),
+                ],
+            }));
+        }
+        app.panels.pattern_help = name == "syntax";
+        if name == "invalid" {
+            let _ = app.update(Message::Pattern("{Word}{Word}[0-9]+".into()));
+        }
+        if name == "running" {
+            let operation = app.operation(Action::Crack).unwrap();
+            let mut job = app.runner.start(1, operation, true).unwrap();
+            job.started = true;
+            app.jobs.push(job);
+            app.candidate_progress = Some((2048, "4,000".into()));
+        }
+        if name == "hashcat" {
+            app.engine = Engine::Hashcat;
+        }
+        app.demo = false;
+        for (width, height) in [(900, 680), (1120, 850)] {
+            render_preview(
+                &app,
+                &directory.join(format!("{name}-{width}.ppm")),
+                width,
+                height,
+            );
+        }
+    }
+}
+
+fn render_preview(app: &App, path: &std::path::Path, width: u32, height: u32) {
+    let size = Size::new(width as f32, height as f32);
+    let mut renderer = iced_tiny_skia::Renderer::new(Font::DEFAULT, 16.0.into());
+    let mut pixels = tiny_skia::Pixmap::new(width, height).unwrap();
+    let mut mask = tiny_skia::Mask::new(width, height).unwrap();
+    let mut ui = UserInterface::build(
+        app.view(),
+        size,
+        user_interface::Cache::default(),
+        &mut renderer,
+    );
+    let mut messages = Vec::new();
+    let _ = ui.update(
+        &[Event::Window(iced::window::Event::RedrawRequested(
+            Instant::now(),
+        ))],
+        mouse::Cursor::Unavailable,
+        &mut renderer,
+        &mut core::clipboard::Null,
+        &mut messages,
+    );
+    ui.draw(
+        &mut renderer,
+        &app.theme(),
+        &core::renderer::Style {
+            text_color: appearance::FOREGROUND,
+        },
+        mouse::Cursor::Unavailable,
+    );
+    renderer.draw(
+        &mut pixels.as_mut(),
+        &mut mask,
+        &Viewport::with_physical_size(Size::new(width, height), 1.0),
+        &[Rectangle::with_size(size)],
+        appearance::BACKGROUND,
+    );
+    let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
+    for pixel in pixels.pixels() {
+        // The renderer's software surface uses BGR for presentation.
+        ppm.extend([pixel.blue(), pixel.green(), pixel.red()]);
+    }
+    fs::write(path, ppm).unwrap();
+}

@@ -1,6 +1,6 @@
 use super::{
     Action, App, Authorization, CommandActivity, Engine, Message, Network, Operation, Page, Panel,
-    Tool, appearance as style,
+    RecoveryMode, Tool, appearance as style,
 };
 use iced::{
     Border, Center, Element, Fill, Font, Length, Theme,
@@ -29,7 +29,11 @@ impl App {
             Page::Recover => self.recover(),
         };
         let stage = scrollable(container(screen).center_x(Fill).padding(iced::Padding {
-            top: 16.0,
+            top: if matches!(self.page, Page::Capture | Page::Recover) {
+                8.0
+            } else {
+                16.0
+            },
             bottom: 8.0,
             left: 14.0,
             right: 14.0,
@@ -741,113 +745,400 @@ impl App {
             .jobs
             .iter()
             .find(|job| matches!(job.operation, Operation::Capture { .. }));
+        let checking = self
+            .jobs
+            .iter()
+            .find(|job| matches!(job.operation, Operation::Inspect { .. }));
+        let switching = matches!(self.pending, Some(Operation::Capture { .. }));
+        let idle = !self.radio_busy() && !self.offline_busy() && self.pending.is_none();
+        let can_record = self.target.is_some()
+            && self
+                .interface
+                .as_ref()
+                .is_some_and(|interface| interface.monitor)
+            && !self.offline_busy()
+            && self.jobs.iter().all(|job| {
+                !job.operation.radio() || matches!(job.operation, Operation::Scan { .. })
+            });
+        let found =
+            self.capture_check == Some(super::Inspection::Found) && idle && self.capture_available;
+        let elapsed = self
+            .capture_started
+            .map_or(0, |start| start.elapsed().as_secs());
+        let clients = self.target.as_ref().map_or(0, |target| {
+            self.survey
+                .stations
+                .iter()
+                .filter(|station| station.bssid == target.bssid)
+                .count()
+        });
+
+        let (title, explanation, busy) = if switching {
+            (
+                "Preparing to record".to_string(),
+                "Finishing discovery and switching to your selected network’s channel.",
+                true,
+            )
+        } else if let Some(job) = capture {
+            if job.stopping {
+                (
+                    "Saving your recording".into(),
+                    if self.check_after_capture {
+                        "The handshake check will start as soon as recording stops."
+                    } else {
+                        "Wait for the recording to finish saving before checking it."
+                    },
+                    true,
+                )
+            } else if !job.started {
+                (
+                    "Starting recording".into(),
+                    "Keep a phone or laptop nearby. You’ll reconnect it once recording starts.",
+                    true,
+                )
+            } else {
+                (
+                    format!("Recording · {:02}:{:02}", elapsed / 60, elapsed % 60),
+                    "On a phone or laptop, turn Wi-Fi off and on, then reconnect to this network. Once it reconnects, stop and check the recording.",
+                    true,
+                )
+            }
+        } else if checking.is_some() {
+            (
+                "Checking for a handshake".into(),
+                "Checking the saved recording for your selected network. This usually takes a moment.",
+                true,
+            )
+        } else if found {
+            (
+                if self.demo {
+                    "Demo handshake found"
+                } else {
+                    "Handshake found"
+                }
+                .into(),
+                if self.demo {
+                    "This is a simulated result. Choose Next to preview password recovery."
+                } else {
+                    "Your recording contains a handshake for this network. Choose Next to open Recover and select a wordlist."
+                },
+                false,
+            )
+        } else if self.capture_check == Some(super::Inspection::NotFound) {
+            (
+                "No handshake found yet".into(),
+                "Try another recording. Start first, reconnect a device to this Wi-Fi, then stop and check again.",
+                false,
+            )
+        } else if self.capture_check == Some(super::Inspection::Unknown) {
+            (
+                "Couldn’t verify this recording".into(),
+                "See Activity for the check details, then retry. You can also start a new recording.",
+                false,
+            )
+        } else if self.capture_available {
+            (
+                "Recording ready to check".into(),
+                "Check this recording for a handshake before moving to password recovery.",
+                false,
+            )
+        } else if !self.capture_path.is_empty() {
+            (
+                "Capture file unavailable".into(),
+                "The file is missing or empty. Choose a different file below, or start a new recording.",
+                false,
+            )
+        } else {
+            (
+                "Ready to record".into(),
+                "Start recording, then reconnect a phone or laptop to this Wi-Fi. Your recording is saved automatically; stop and check once the device reconnects.",
+                false,
+            )
+        };
+
+        let target: Element<'_, Message> = if let Some(target) = &self.target {
+            column![
+                text(target.label()).font(style::SEMIBOLD).size(16),
+                text(format!(
+                    "{}  ·  Channel {}{}",
+                    target.bssid,
+                    target.channel,
+                    if self.capture_running() {
+                        format!(
+                            "  ·  {clients} {} seen",
+                            if clients == 1 { "device" } else { "devices" }
+                        )
+                    } else {
+                        String::new()
+                    }
+                ))
+                .font(Font::MONOSPACE)
+                .size(11)
+                .color(style::MUTED),
+            ]
+            .spacing(5)
+            .width(Fill)
+            .into()
+        } else {
+            text("Select a network in Discover first.")
+                .size(14)
+                .width(Fill)
+                .into()
+        };
+        let network = row![
+            target,
+            button(text("Change").size(12))
+                .on_press_maybe(
+                    (capture.is_none() && checking.is_none() && !switching)
+                        .then_some(Message::Page(Page::Discover))
+                )
+                .padding([8, 4])
+                .style(style::quiet),
+        ]
+        .spacing(12)
+        .align_y(Center)
+        .width(Fill);
+        let indicator: Element<'_, Message> = if busy {
+            self.spinner()
+        } else {
+            container(
+                text(if found { "✓" } else { "○" })
+                    .size(26)
+                    .color(if found { style::ACCENT } else { style::MUTED }),
+            )
+            .center_x(36)
+            .center_y(36)
+            .into()
+        };
+        let mut body = column![
+            container(
+                row![indicator, text(title).size(23).font(style::SEMIBOLD)]
+                    .spacing(10)
+                    .align_y(Center)
+            )
+            .center_x(Fill),
+            text(explanation)
+                .size(14)
+                .line_height(1.5)
+                .color(style::MUTED)
+                .align_x(Center)
+                .width(Fill),
+        ]
+        .spacing(10)
+        .align_x(Center)
+        .width(Fill);
+
+        if let Some(job) = capture {
+            if job.started && !job.stopping {
+                body = body.push(
+                    button(
+                        text("Stop & check")
+                            .size(15)
+                            .font(style::SEMIBOLD)
+                            .align_x(Center)
+                            .width(Fill),
+                    )
+                    .on_press_maybe(
+                        (!self.closing && self.authorization == Authorization::Ready)
+                            .then_some(Message::StopAndCheck),
+                    )
+                    .padding([15, 20])
+                    .width(Fill)
+                    .style(style::primary),
+                );
+            }
+        } else if let Some(job) = checking {
+            body = body.push(
+                button(text("Cancel check").size(12))
+                    .on_press_maybe((!job.stopping).then_some(Message::Stop(job.id)))
+                    .style(style::quiet),
+            );
+        } else if !switching {
+            if self.target.is_none() {
+                body = body.push(
+                    button(text("Choose a network").align_x(Center).width(Fill))
+                        .on_press(Message::Page(Page::Discover))
+                        .width(Fill)
+                        .padding(15)
+                        .style(style::primary),
+                );
+            } else if found {
+                body = body.push(
+                    text("Ready for Recover →")
+                        .size(13)
+                        .font(style::SEMIBOLD)
+                        .color(style::ACCENT),
+                );
+            } else if self.capture_check == Some(super::Inspection::NotFound)
+                || !self.capture_available
+            {
+                body = body.push(
+                    self.action(
+                        if self.capture_path.is_empty() {
+                            "Start recording"
+                        } else {
+                            "Record again"
+                        },
+                        Action::Capture,
+                        can_record,
+                    )
+                    .width(Fill),
+                );
+            } else {
+                body = body.push(
+                    self.action(
+                        if self.capture_check == Some(super::Inspection::Unknown) {
+                            "Retry check"
+                        } else {
+                            "Check handshake"
+                        },
+                        Action::Inspect,
+                        idle && self.capture_available,
+                    )
+                    .width(Fill),
+                );
+            }
+            if !can_record && !self.capture_available && self.target.is_some() {
+                body = body.push(
+                    text("Return to Monitoring and enable monitor mode to record.")
+                        .size(12)
+                        .color(style::MUTED),
+                );
+            }
+        }
+        let card = container(
+            column![
+                network,
+                widget::rule::horizontal(1).style(style::divider),
+                body
+            ]
+            .spacing(12),
+        )
+        .padding(16)
+        .width(Fill)
+        .style(move |theme| {
+            let mut card = style::card(theme);
+            if found {
+                card.border.color = style::ACCENT.scale_alpha(0.6);
+            }
+            card
+        });
+        let mut content = column![card].spacing(10).width(Fill);
+
+        if self.capture_running() {
+            content = content.push(self.reconnect_options());
+        }
+        content = content.push(disclosure(
+            if self.capture_path.is_empty() {
+                "Use an existing capture instead"
+            } else {
+                "Recording file & other options"
+            },
+            self.panels.capture_file,
+            Panel::CaptureFile,
+        ));
+        if self.panels.capture_file {
+            let discovery_running = self
+                .jobs
+                .iter()
+                .any(|job| matches!(job.operation, Operation::Scan { .. }));
+            let editor = column![
+                text("Capture file").size(12).color(style::MUTED),
+                text_input("/path/to/capture.cap", &self.capture_path)
+                    .on_input_maybe(idle.then_some(Message::CapturePath as fn(String) -> Message))
+                    .padding(13)
+                    .size(13)
+                    .style(style::input),
+                text(if idle {
+                    "Choose an existing file, then check it for the selected network."
+                } else if discovery_running {
+                    "Stop discovery to choose and check an existing capture."
+                } else {
+                    "Your recording is being saved here. File changes are available once it stops."
+                })
+                .size(12)
+                .color(style::MUTED),
+            ]
+            .spacing(8);
+            let mut options = column![editor].spacing(14);
+            if discovery_running {
+                options = options.push(
+                    button(text("Stop discovery").size(13))
+                        .on_press(Message::StopAll)
+                        .style(style::secondary)
+                        .padding([10, 16]),
+                );
+            }
+            if idle && !self.capture_path.is_empty() {
+                options = options.push(
+                    row![
+                        self.action("Check again", Action::Inspect, self.capture_available)
+                            .style(style::secondary)
+                            .width(Fill),
+                        self.action("New recording", Action::Capture, can_record)
+                            .style(style::secondary)
+                            .width(Fill),
+                    ]
+                    .spacing(12),
+                );
+            }
+            content = content.push(options);
+        }
+        container(content).max_width(640).width(Fill).into()
+    }
+
+    fn reconnect_options(&self) -> Element<'_, Message> {
         let deauth = self
             .jobs
             .iter()
             .any(|job| matches!(job.operation, Operation::Deauth { .. }));
-        let idle = !self.radio_busy() && !self.offline_busy();
-        let mut content = column![
-            heading(
-                "Listen for a handshake.",
-                "Record authentication traffic from your selected network."
-            ),
-            self.target_summary(),
-        ]
-        .spacing(20)
-        .width(Fill);
-        if let Some(job) = capture {
-            content = content.push(self.job_strip(job));
-        } else {
-            content = content.push(
-                self.action(
-                    "Start capture",
-                    Action::Capture,
-                    self.target.is_some()
-                        && self
-                            .interface
-                            .as_ref()
-                            .is_some_and(|interface| interface.monitor)
-                        && self.jobs.iter().all(|job| {
-                            !job.operation.radio()
-                                || matches!(job.operation, Operation::Scan { .. })
-                        })
-                        && self.pending.is_none(),
-                )
-                .width(Fill),
-            );
-        }
-
-        content = content.push(disclosure(
-            "Reconnect a client",
+        let mut content = column![disclosure(
+            "Need help reconnecting a device?",
             self.panels.reconnect,
-            Panel::Reconnect,
-        ));
+            Panel::Reconnect
+        )]
+        .spacing(12);
         if self.panels.reconnect {
-            let mut reconnect = column![
-                text("Send a finite deauthentication burst to trigger a new handshake.")
-                    .size(13)
-                    .color(style::MUTED),
+            let mut options = column![
+                text("You can reconnect a device manually. Or send a brief disconnect request below so it can reconnect while recording continues.").size(13).line_height(1.5).color(style::MUTED),
                 row![
-                    field(
-                        "Client MAC · blank for all clients",
-                        "AA:BB:CC:DD:EE:FF",
-                        &self.station,
-                        Message::Station
-                    ),
-                    container(field("Bursts", "5", &self.count, Message::Count)).width(80),
-                ]
-                .spacing(12),
-            ]
-            .spacing(14);
+                    field("Device MAC · empty means all devices", "AA:BB:CC:DD:EE:FF", &self.station, Message::Station),
+                    container(field("Bursts", "5", &self.count, Message::Count)).width(90),
+                ].spacing(12),
+            ].spacing(14);
             if let Some(target) = &self.target {
-                let clients = self
+                let mut clients = row![
+                    button(text("All devices").size(11))
+                        .on_press(Message::Station(String::new()))
+                        .style(style::secondary)
+                        .padding([6, 8])
+                ]
+                .spacing(6);
+                for station in self
                     .survey
                     .stations
                     .iter()
                     .filter(|station| station.bssid == target.bssid)
-                    .fold(row![].spacing(6), |clients, station| {
-                        clients.push(
-                            button(text(&station.mac).font(Font::MONOSPACE).size(11))
-                                .on_press(Message::Station(station.mac.clone()))
-                                .style(style::secondary)
-                                .padding([6, 8]),
-                        )
-                    });
-                reconnect = reconnect.push(clients.wrap());
+                {
+                    clients = clients.push(
+                        button(text(&station.mac).font(Font::MONOSPACE).size(11))
+                            .on_press(Message::Station(station.mac.clone()))
+                            .style(style::secondary)
+                            .padding([6, 8]),
+                    );
+                }
+                options = options.push(clients.wrap());
             }
-            reconnect = reconnect.push(
-                self.action(
-                    if deauth {
-                        "Sending…"
-                    } else {
-                        "Send deauth burst"
-                    },
-                    Action::Deauth,
-                    self.capture_running() && !deauth,
-                )
-                .style(style::secondary)
-                .width(Fill),
-            );
+            options = options.push(self.action(if deauth { "Sending request…" } else { "Send disconnect request" }, Action::Deauth, self.capture_running() && !deauth).style(style::secondary).width(Fill))
+                .push(text("This briefly interrupts Wi-Fi for the selected device, or all devices if left empty. Reconnection is not guaranteed.").size(12).color(style::MUTED));
             content = content.push(
-                container(reconnect)
+                container(options)
                     .padding(20)
                     .width(Fill)
                     .style(style::card),
             );
         }
-        content = content.push(disclosure(
-            "Capture file & inspection",
-            self.panels.capture_file,
-            Panel::CaptureFile,
-        ));
-        if self.panels.capture_file {
-            content = content.push(column![
-                field("Capture file", "/path/to/capture.cap", &self.capture_path, Message::CapturePath),
-                self.action("Inspect handshake", Action::Inspect, idle && !self.capture_path.is_empty()).style(style::secondary),
-                text("Stop recording before inspection. The command output reports whether a usable handshake was captured.").size(12).color(style::MUTED),
-            ].spacing(12));
-        }
-        container(content).max_width(590).width(Fill).into()
+        content.width(Fill).into()
     }
 
     fn recover(&self) -> Element<'_, Message> {
@@ -859,6 +1150,14 @@ impl App {
         });
         let idle = !self.offline_busy() && !self.radio_busy();
         let is_hashcat = self.engine == Engine::Hashcat;
+        let pattern_mode = self.recovery_mode == RecoveryMode::Pattern;
+        let needs_words = !pattern_mode
+            || self
+                .pattern_check
+                .as_ref()
+                .is_ok_and(|pattern| pattern.needs_words());
+        let candidate_input_ready = (!pattern_mode || self.pattern_check.is_ok())
+            && (!needs_words || !self.wordlist.is_empty());
         let engine = [Engine::Aircrack, Engine::Hashcat].into_iter().fold(
             row![].spacing(8),
             |choices, engine| {
@@ -880,17 +1179,15 @@ impl App {
                 )
             },
         );
-        let mut content = column![
-            heading(
-                "Test your wordlist.",
-                "Recover a WPA/WPA2 password from captured authentication data."
-            ),
-            engine,
-        ]
-        .spacing(14)
+        let mut content = column![heading(
+            "Recover the password.",
+            "Try complete passwords or build candidates from a pattern."
+        )]
+        .spacing(10)
         .width(Fill);
+        let mut settings = column![engine].spacing(12).width(Fill);
         if is_hashcat {
-            content = content
+            settings = settings
                 .push(field(
                     "Hash file",
                     "/path/to/handshake.hc22000",
@@ -903,7 +1200,7 @@ impl App {
                     Panel::Conversion,
                 ));
             if self.panels.conversion {
-                content = content.push(
+                settings = settings.push(
                     container(
                         column![
                             field(
@@ -928,7 +1225,7 @@ impl App {
                 );
             }
         } else {
-            content = content.push(field(
+            settings = settings.push(field(
                 "Capture file",
                 "/path/to/capture.cap",
                 &self.capture_path,
@@ -940,7 +1237,7 @@ impl App {
                 .map_or("Select a target in Discover".into(), |network| {
                     format!("Target: {}", network.label())
                 });
-            content = content.push(
+            settings = settings.push(
                 row![
                     text(selected).size(12).color(style::MUTED).width(Fill),
                     link("Change", Message::Page(Page::Discover)),
@@ -956,14 +1253,69 @@ impl App {
                 .align_y(Center),
             );
         }
-        content = content.push(field(
-            "Wordlist",
-            "/path/to/wordlist.txt",
-            &self.wordlist,
-            Message::Wordlist,
-        ));
+        let modes = [RecoveryMode::Dictionary, RecoveryMode::Pattern]
+            .into_iter()
+            .fold(row![].spacing(8), |choices, mode| {
+                let selected = self.recovery_mode == mode;
+                choices.push(
+                    button(
+                        text(if mode == RecoveryMode::Dictionary {
+                            "Dictionary"
+                        } else {
+                            "Pattern / regex"
+                        })
+                        .size(13)
+                        .align_x(Center)
+                        .width(Fill),
+                    )
+                    .on_press_maybe(idle.then_some(Message::RecoveryMode(mode)))
+                    .padding([10, 16])
+                    .width(Fill)
+                    .style(move |_, status| style::choice(selected, status)),
+                )
+            });
+        content = content.push(modes);
+        if needs_words {
+            content = content.push(
+                column![
+                    text(if pattern_mode {
+                        "Source wordlist · one word per line"
+                    } else {
+                        "Wordlist · one complete password per line"
+                    })
+                    .size(12)
+                    .color(style::MUTED),
+                    text_input("/path/to/wordlist.txt", &self.wordlist)
+                        .on_input_maybe(idle.then_some(Message::Wordlist as fn(String) -> Message))
+                        .padding(12)
+                        .size(14)
+                        .style(style::input),
+                ]
+                .spacing(8),
+            );
+        }
+        if pattern_mode {
+            content = content.push(self.pattern_editor(idle));
+        }
         if let Some(job) = offline {
             content = content.push(self.job_strip(job));
+            if matches!(
+                job.operation,
+                Operation::Crack {
+                    pattern: Some(_),
+                    ..
+                }
+            ) && let Some((generated, total)) = &self.candidate_progress
+            {
+                content = content.push(
+                    text(format!(
+                        "{} / {total} candidates generated",
+                        crate::pattern::format_count(u128::from(*generated))
+                    ))
+                    .size(12)
+                    .color(style::MUTED),
+                );
+            }
         } else {
             let has_input = if is_hashcat {
                 !self.hash_path.is_empty()
@@ -974,13 +1326,98 @@ impl App {
                         .as_ref()
                         .is_some_and(|target| target.supports_dictionary())
             };
-            content = content.push(
-                self.action(
+            let start = self
+                .action(
                     "Start recovery",
                     Action::Crack,
-                    idle && has_input && !self.wordlist.is_empty(),
+                    idle && has_input && candidate_input_ready,
                 )
-                .width(Fill),
+                .width(Fill);
+            if pattern_mode {
+                content = content.push(
+                    row![
+                        button(
+                            text(if self.preview_cancel.is_some() {
+                                "Reading wordlist…"
+                            } else {
+                                "Preview & count"
+                            })
+                            .size(13)
+                        )
+                        .on_press_maybe(
+                            (idle && candidate_input_ready && self.preview_cancel.is_none())
+                                .then_some(Message::PreviewPattern)
+                        )
+                        .padding([14, 16])
+                        .style(style::secondary),
+                        start,
+                    ]
+                    .spacing(10),
+                );
+            } else {
+                content = content.push(start);
+            }
+        }
+        if pattern_mode {
+            if let Some(preview) = &self.pattern_preview {
+                match preview {
+                    Ok(preview) => {
+                        let mut examples = column![
+                            text(format!(
+                                "{} candidate combinations",
+                                crate::pattern::format_count(preview.total)
+                            ))
+                            .size(14)
+                            .font(style::SEMIBOLD),
+                            text(format!(
+                                "{} source entries · 8–63 byte candidates",
+                                crate::pattern::format_count(preview.words as u128)
+                            ))
+                            .size(12)
+                            .color(style::MUTED),
+                        ]
+                        .spacing(7);
+                        for sample in preview.samples.iter().take(3) {
+                            examples = examples.push(text(sample).font(Font::MONOSPACE).size(12));
+                        }
+                        content = content.push(
+                            container(examples)
+                                .padding(14)
+                                .width(Fill)
+                                .style(style::card),
+                        );
+                    }
+                    Err(error) => {
+                        content = content.push(text(error).size(12).color(style::ERROR));
+                    }
+                }
+            }
+            content = content.push(self.pattern_help(idle));
+            content = content.push(text("Candidates are generated on demand. No combined wordlist is saved; large combinations can still take a long time.").size(12).color(style::MUTED));
+        }
+        content = content.push(disclosure(
+            if is_hashcat {
+                "Hashcat · capture & engine settings"
+            } else {
+                "Aircrack-ng · capture & engine settings"
+            },
+            self.panels.recovery_settings,
+            Panel::RecoverySettings,
+        ));
+        if self.panels.recovery_settings {
+            content = content.push(
+                container(settings)
+                    .padding(16)
+                    .width(Fill)
+                    .style(style::card),
+            );
+        } else if (is_hashcat && self.hash_path.is_empty())
+            || (!is_hashcat && self.capture_path.is_empty())
+        {
+            content = content.push(
+                text("Choose an input file in capture & engine settings to begin.")
+                    .size(12)
+                    .color(style::MUTED),
             );
         }
         let required_tool = if is_hashcat {
@@ -1021,38 +1458,68 @@ impl App {
             content = content.push(column![
                 text("Files are saved locally in").size(12).color(style::MUTED),
                 text(self.session.to_string_lossy().into_owned()).size(12).font(Font::MONOSPACE),
-                text(if is_hashcat { "Hashcat processes every record in the supplied hash file." } else { "Dictionary recovery requires a WPA/WPA2 PSK network. SAE and enterprise authentication use different workflows." }).size(12).color(style::MUTED),
+                text(if is_hashcat { "Hashcat processes every record in the supplied hash file." } else { "Recovery requires a WPA/WPA2 PSK network. SAE and enterprise authentication use different workflows." }).size(12).color(style::MUTED),
             ].spacing(8));
         }
         container(content).max_width(590).width(Fill).into()
     }
 
-    fn target_summary(&self) -> Element<'_, Message> {
-        let mut summary = row![].spacing(16).align_y(Center);
-        if let Some(target) = &self.target {
-            summary = summary.push(
-                column![
-                    text(target.label()).font(style::SEMIBOLD).size(17),
-                    text(format!(
-                        "{}   ·   CH {}   ·   {}",
-                        target.bssid, target.channel, target.security
-                    ))
-                    .font(Font::MONOSPACE)
-                    .size(11)
-                    .color(style::MUTED),
-                ]
-                .spacing(7)
-                .width(Fill),
-            );
-        } else {
-            summary = summary.push(text("Choose a network to capture.").size(14).width(Fill));
+    fn pattern_editor(&self, idle: bool) -> Element<'_, Message> {
+        let mut editor = column![
+            text("Password pattern").size(12).color(style::MUTED),
+            text_input("{Word}{Word}[0-9]{3}", &self.pattern)
+                .on_input_maybe(idle.then_some(Message::Pattern as fn(String) -> Message))
+                .font(Font::MONOSPACE)
+                .padding(12)
+                .size(14)
+                .style(style::input),
+        ]
+        .spacing(8)
+        .width(Fill);
+        if let Err(error) = &self.pattern_check {
+            editor = editor.push(text(error).size(12).color(style::ERROR));
         }
-        summary = summary.push(link("Change", Message::Page(Page::Discover)));
-        container(summary)
-            .padding(20)
-            .width(Fill)
-            .style(style::card)
-            .into()
+        editor.into()
+    }
+
+    fn pattern_help(&self, idle: bool) -> Element<'_, Message> {
+        let mut help = column![
+            row![
+                button(text("2 words + 3 digits").size(12))
+                    .on_press_maybe(idle.then(|| Message::Pattern("{Word}{Word}[0-9]{3}".into())))
+                    .padding([6, 10])
+                    .style(style::secondary),
+                button(text("5 words").size(12))
+                    .on_press_maybe(idle.then(|| Message::Pattern("{word}{5}".into())))
+                    .padding([6, 10])
+                    .style(style::secondary),
+                widget::space().width(Fill),
+                button(
+                    text(if self.panels.pattern_help {
+                        "−  Syntax & examples"
+                    } else {
+                        "+  Syntax & examples"
+                    })
+                    .size(12)
+                )
+                .on_press(Message::Toggle(Panel::PatternHelp))
+                .padding([6, 0])
+                .style(style::quiet),
+            ]
+            .spacing(8)
+            .align_y(Center),
+        ]
+        .spacing(8)
+        .width(Fill);
+        if self.panels.pattern_help {
+            help = help.push(column![
+                text("{word}  as written    {Word}  Capitalized\n{WORD}  UPPERCASE     {lower}  lowercase").font(Font::MONOSPACE).size(12),
+                text("{word}{5} = five independent choices from your list. A word may be chosen more than once.").size(12).color(style::MUTED),
+                text("Use [0-9] or \\d for a digit, {3} for exactly three, {1,5} for one to five, and (red|blue) for alternatives. Literal spaces and punctuation are preserved; escape regex punctuation with \\. For five words separated by hyphens: ({word}-){4}{word}.").size(12).color(style::MUTED),
+                text("Repeats must be bounded; * and +, lookarounds, and backreferences are not supported. Character classes use printable ASCII; case tokens change A–Z / a–z. Only complete 8–63 byte passphrases are sent.").size(12).color(style::MUTED),
+            ].spacing(8));
+        }
+        help.into()
     }
 
     fn job_strip<'a>(&self, job: &'a crate::runner::Job) -> Element<'a, Message> {

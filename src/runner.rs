@@ -11,7 +11,7 @@ use nix::{
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, BufRead, BufReader, BufWriter, Read, Write},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -24,7 +24,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod inspection;
 mod session;
+pub use inspection::Inspection;
 pub use session::{Authorization, session_worker_main};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +34,8 @@ pub enum Event {
     Started,
     Line(String),
     Survey(Survey),
+    Inspection(Inspection),
+    Candidates { generated: u64, total: String },
     NetworkRestore(Option<NetworkRestore>),
     MonitorReady(Interface),
     Finished { code: Option<i32>, cancelled: bool },
@@ -147,6 +151,9 @@ impl Runner {
                         "[DEMO] Simulated job; no command executed or capture written.".into(),
                     ),
                 ));
+                if matches!(operation, Operation::Inspect { .. }) && !flag.load(Ordering::Relaxed) {
+                    let _ = sender.send((id, Event::Inspection(Inspection::Found)));
+                }
                 let _ = sender.send((
                     id,
                     Event::Finished {
@@ -342,6 +349,9 @@ fn execute(
         return Ok(());
     }
     sink(Event::Started);
+    if let Operation::Inspect { bssid, .. } = &request.operation {
+        return inspection::run(&request.executable, &spec.args, bssid, cancel, sink);
+    }
     if let Operation::Monitor {
         interface,
         enable,
@@ -441,17 +451,85 @@ fn run_process(
             stdout: String::new(),
         });
     }
+    let candidates = if let Some(Operation::Crack {
+        pattern: Some(pattern),
+        wordlist,
+        ..
+    }) = operation
+    {
+        sink(Event::Line(format!("Pattern: {pattern}")));
+        let parsed = crate::pattern::Pattern::parse(pattern)?;
+        if parsed.needs_words() {
+            sink(Event::Line(format!(
+                "Source wordlist: {}",
+                wordlist.display()
+            )));
+        }
+        sink(Event::Line("Preparing candidates for stdin…".into()));
+        let prepared = parsed.prepare(wordlist, &cancel);
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(monitor::Output {
+                code: None,
+                cancelled: true,
+                stdout: String::new(),
+            });
+        }
+        let prepared = prepared?;
+        sink(Event::Line(format!(
+            "Streaming {} candidate combinations (8–63 bytes); no combined wordlist is written.",
+            crate::pattern::format_count(prepared.total)
+        )));
+        sink(Event::Candidates {
+            generated: 0,
+            total: crate::pattern::format_count(prepared.total),
+        });
+        Some(prepared)
+    } else {
+        None
+    };
     let mut child = Command::new(executable)
         .args(args)
         .env("LC_ALL", "C")
         .env("TERM", "dumb")
-        .stdin(Stdio::null())
+        .stdin(if candidates.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
         .spawn()
         .map_err(|e| format!("Cannot run {}: {e}", executable.display()))?;
     let group = Pid::from_raw(child.id() as i32);
+    let mut feeder = candidates.map(|candidates| {
+        let input = child.stdin.take().unwrap();
+        let flag = cancel.clone();
+        let progress = sink.clone();
+        thread::spawn(move || {
+            let total = crate::pattern::format_count(candidates.total);
+            let mut output = BufWriter::with_capacity(64 * 1024, input);
+            let mut generated = 0u64;
+            let mut last_update = Instant::now();
+            let result = candidates
+                .generate(&flag, |candidate| {
+                    output.write_all(candidate)?;
+                    output.write_all(b"\n")?;
+                    generated = generated.saturating_add(1);
+                    if last_update.elapsed() >= Duration::from_secs(1) {
+                        progress(Event::Candidates {
+                            generated,
+                            total: total.clone(),
+                        });
+                        last_update = Instant::now();
+                    }
+                    Ok(true)
+                })
+                .and_then(|()| output.flush());
+            progress(Event::Candidates { generated, total });
+            result
+        })
+    });
     let out = child.stdout.take().unwrap();
     let err = child.stderr.take().unwrap();
     let output_sink = sink.clone();
@@ -493,8 +571,14 @@ fn run_process(
             Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(error) => {
+                if feeder.is_some() {
+                    cancel.store(true, Ordering::Relaxed);
+                }
                 let _ = killpg(group, Signal::SIGKILL);
                 let _ = child.wait();
+                if let Some(feeder) = feeder.take() {
+                    let _ = feeder.join();
+                }
                 return Err(error.to_string());
             }
         }
@@ -502,6 +586,17 @@ fn run_process(
     };
     // A script can exit while descendants still own its pipes.
     let _ = killpg(group, Signal::SIGKILL);
+    if let Some(feeder) = feeder {
+        cancel.store(true, Ordering::Relaxed);
+        if let Err(error) = feeder
+            .join()
+            .map_err(|_| "Pattern generator stopped unexpectedly.")?
+            && error.kind() != io::ErrorKind::BrokenPipe
+            && stopped_at.is_none()
+        {
+            return Err(format!("Cannot send generated candidates: {error}"));
+        }
+    }
     let stdout = reader.join().unwrap_or_default();
     let _ = errors.join();
     if let Some(operation) = operation {
@@ -570,6 +665,103 @@ mod tests {
     use std::{os::unix::fs::PermissionsExt, sync::Mutex};
 
     const SCAN_CSV: &str = "02:11:22:33:44:55, first, last, 6, 54, WPA2, CCMP, PSK, -40, 20, 0, 0.0.0.0, 7, Lab One, \n";
+
+    fn pattern_operation(wordlist: PathBuf, source: &str) -> Operation {
+        Operation::Crack {
+            engine: crate::command::Engine::Aircrack,
+            input: "/unused-synthetic.cap".into(),
+            wordlist,
+            pattern: Some(source.into()),
+            bssid: "02:00:00:00:00:01".into(),
+            output: "/unused-result.txt".into(),
+        }
+    }
+
+    #[test]
+    fn generated_candidates_reach_stdin_with_eof_and_progress() {
+        let directory = tempfile::tempdir().unwrap();
+        let words = directory.path().join("words.txt");
+        fs::write(&words, b"ab\ncd\n").unwrap();
+        let operation = pattern_operation(words, "{word}{5}");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let received = events.clone();
+        let result = run_process(
+            Path::new("/bin/sh"),
+            &["-c".into(), "exec cat".into()],
+            Some(&operation),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(move |event| received.lock().unwrap().push(event)),
+            Some(Duration::from_secs(5)),
+        )
+        .unwrap();
+        assert_eq!(result.code, Some(0));
+        assert!(!result.cancelled);
+        let lines: Vec<_> = result.stdout.lines().collect();
+        assert_eq!(lines.len(), 32);
+        assert_eq!(lines[0], "ababababab");
+        assert_eq!(lines[31], "cdcdcdcdcd");
+        assert!(events.lock().unwrap().iter().any(
+            |event| matches!(event, Event::Candidates { generated: 32, total } if total == "32")
+        ));
+        assert_eq!(
+            fs::read_dir(directory.path()).unwrap().count(),
+            1,
+            "no expanded dictionary should be written"
+        );
+    }
+
+    #[test]
+    fn early_tool_exit_stops_a_large_candidate_stream() {
+        let operation = pattern_operation(PathBuf::new(), "[a-z]{20}");
+        let start = Instant::now();
+        let result = run_process(
+            Path::new("/bin/sh"),
+            &[
+                "-c".into(),
+                "IFS= read -r line; printf '%s\\n' \"$line\"".into(),
+            ],
+            Some(&operation),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(|_| {}),
+            Some(Duration::from_secs(5)),
+        )
+        .unwrap();
+        assert_eq!(result.code, Some(0));
+        assert!(!result.cancelled);
+        assert_eq!(result.stdout.trim_end(), "a".repeat(20));
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn cancelling_recovery_unblocks_a_full_stdin_pipe() {
+        let operation = pattern_operation(PathBuf::new(), "[a-z]{20}");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let (sender, received) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            run_process(
+                Path::new("/bin/sh"),
+                &["-c".into(), "printf 'ready\\n'; sleep 30".into()],
+                Some(&operation),
+                flag,
+                Arc::new(move |event| {
+                    let _ = sender.send(event);
+                }),
+                Some(Duration::from_secs(5)),
+            )
+        });
+        loop {
+            if matches!(received.recv_timeout(Duration::from_secs(5)).unwrap(), Event::Line(line) if line == "ready")
+            {
+                break;
+            }
+        }
+        // The child never reads stdin, so the producer fills the pipe and blocks.
+        thread::sleep(Duration::from_millis(150));
+        cancel.store(true, Ordering::Relaxed);
+        let result = handle.join().unwrap().unwrap();
+        assert!(result.cancelled);
+    }
 
     #[test]
     fn snapshots_publish_changes_and_preserve_results_during_empty_rewrites() {

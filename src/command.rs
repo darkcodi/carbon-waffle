@@ -2,7 +2,7 @@ use crate::model::{valid_interface, valid_mac};
 use serde::{Deserialize, Serialize};
 use std::{
     fmt,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -91,6 +91,8 @@ pub enum Operation {
         engine: Engine,
         input: PathBuf,
         wordlist: PathBuf,
+        #[serde(default)]
+        pattern: Option<String>,
         bssid: String,
         output: PathBuf,
     },
@@ -132,6 +134,9 @@ impl Operation {
             Self::Deauth { .. } => "Deauthenticate",
             Self::Inspect { .. } => "Inspect capture",
             Self::Convert { .. } => "Convert to hc22000",
+            Self::Crack {
+                pattern: Some(_), ..
+            } => "Pattern recovery",
             Self::Crack { .. } => "Dictionary recovery",
         }
     }
@@ -264,17 +269,13 @@ impl Operation {
                 args.push(iface(interface)?);
                 (Tool::Aireplay, args, true)
             }
-            Self::Inspect { capture, bssid } => (
-                Tool::Aircrack,
-                vec![
-                    "-a".into(),
-                    "2".into(),
-                    "-b".into(),
-                    mac(bssid)?,
-                    path(capture)?,
-                ],
-                false,
-            ),
+            Self::Inspect { capture, bssid } => {
+                mac(bssid)?;
+                // Read the network summary. Forcing WPA without a wordlist
+                // aborts in Aircrack-ng 1.7; -b suppresses handshake counts.
+                // The worker selects the matching summary row and stops here.
+                (Tool::Aircrack, vec![path(capture)?], false)
+            }
             Self::Convert { capture, output } => (
                 Tool::Hcx,
                 vec!["-o".into(), path(output)?, path(capture)?],
@@ -284,45 +285,60 @@ impl Operation {
                 engine,
                 input,
                 wordlist,
+                pattern,
                 bssid,
                 output,
-            } => match engine {
-                Engine::Aircrack => (
-                    Tool::Aircrack,
-                    vec![
-                        "-a".into(),
-                        "2".into(),
-                        "-b".into(),
-                        mac(bssid)?,
-                        "-w".into(),
-                        path(wordlist)?,
-                        "-l".into(),
-                        path(output)?,
-                        path(input)?,
-                    ],
-                    false,
-                ),
-                Engine::Hashcat => (
-                    Tool::Hashcat,
-                    vec![
-                        "-m".into(),
-                        "22000".into(),
-                        "-a".into(),
-                        "0".into(),
-                        "--status".into(),
-                        "--status-timer".into(),
-                        "2".into(),
-                        "--potfile-path".into(),
-                        path(&output.with_extension("potfile"))?,
-                        "--restore-disable".into(),
-                        "--outfile".into(),
-                        path(output)?,
-                        path(input)?,
-                        path(wordlist)?,
-                    ],
-                    false,
-                ),
-            },
+            } => {
+                if let Some(pattern) = pattern {
+                    crate::pattern::Pattern::parse(pattern)?;
+                }
+                match engine {
+                    Engine::Aircrack => (
+                        Tool::Aircrack,
+                        vec![
+                            "-a".into(),
+                            "2".into(),
+                            "-b".into(),
+                            mac(bssid)?,
+                            "-w".into(),
+                            if pattern.is_some() {
+                                "-".into()
+                            } else {
+                                path(wordlist)?
+                            },
+                            "-l".into(),
+                            path(output)?,
+                            path(input)?,
+                        ],
+                        false,
+                    ),
+                    Engine::Hashcat => {
+                        let mut args = vec![
+                            "-m".into(),
+                            "22000".into(),
+                            "-a".into(),
+                            "0".into(),
+                            "--status".into(),
+                            "--status-timer".into(),
+                            "2".into(),
+                            "--potfile-path".into(),
+                            path(&output.with_extension("potfile"))?,
+                            "--restore-disable".into(),
+                            "--outfile".into(),
+                            path(output)?,
+                            path(input)?,
+                        ];
+                        if pattern.is_some() {
+                            // No dictionary argument selects stdin in straight mode.
+                            // Generated literals must not be interpreted as $HEX[].
+                            args.push("--wordlist-autohex-disable".into());
+                        } else {
+                            args.push(path(wordlist)?);
+                        }
+                        (Tool::Hashcat, args, false)
+                    }
+                }
+            }
         };
         Ok(CommandSpec {
             tool,
@@ -333,7 +349,10 @@ impl Operation {
 
     pub fn validate_files(&self) -> Result<(), String> {
         let require = |p: &Path| {
-            std::fs::File::open(p)
+            std::fs::File::options()
+                .read(true)
+                .custom_flags(nix::libc::O_NONBLOCK)
+                .open(p)
                 .and_then(|f| f.metadata())
                 .and_then(|m| {
                     if m.is_file() {
@@ -347,10 +366,19 @@ impl Operation {
         match self {
             Self::Inspect { capture, .. } | Self::Convert { capture, .. } => require(capture)?,
             Self::Crack {
-                input, wordlist, ..
+                input,
+                wordlist,
+                pattern,
+                ..
             } => {
                 require(input)?;
-                require(wordlist)?;
+                let needs_words = match pattern {
+                    Some(source) => crate::pattern::Pattern::parse(source)?.needs_words(),
+                    None => true,
+                };
+                if needs_words {
+                    require(wordlist)?;
+                }
             }
             _ => {}
         }
@@ -384,6 +412,7 @@ mod tests {
             engine: Engine::Aircrack,
             input: "/tmp/$(id).cap".into(),
             wordlist: "/tmp/a b.txt".into(),
+            pattern: None,
             bssid: "02:00:00:00:00:01".into(),
             output: "/tmp/key.txt".into(),
         };
@@ -415,5 +444,54 @@ mod tests {
             ["--bssid", "02:00:00:00:00:01", "--channel", "36"]
         );
         assert!(spec.privileged);
+    }
+
+    #[test]
+    fn pattern_recovery_uses_stdin_and_validates_only_required_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("capture.cap");
+        std::fs::write(&input, b"synthetic").unwrap();
+        for engine in [Engine::Aircrack, Engine::Hashcat] {
+            let mut operation = Operation::Crack {
+                engine,
+                input: input.clone(),
+                wordlist: directory.path().join("words.txt"),
+                pattern: Some("[0-9]{8}".into()),
+                bssid: "02:00:00:00:00:01".into(),
+                output: directory.path().join("result.txt"),
+            };
+            operation.validate_files().unwrap();
+            let spec = operation.spec().unwrap();
+            assert!(!spec.privileged);
+            assert!(!spec.args.iter().any(|arg| arg.ends_with("words.txt")));
+            if engine == Engine::Aircrack {
+                assert_eq!(&spec.args[4..6], ["-w", "-"]);
+            } else {
+                assert_eq!(&spec.args[2..4], ["-a", "0"]);
+                assert_eq!(spec.args.last().unwrap(), "--wordlist-autohex-disable");
+            }
+            if let Operation::Crack { pattern, .. } = &mut operation {
+                *pattern = Some("{word}{2}".into());
+            }
+            assert!(
+                operation.validate_files().is_err(),
+                "word slots need a source file"
+            );
+            if let Operation::Crack { pattern, .. } = &mut operation {
+                *pattern = None;
+            }
+            assert!(
+                operation.validate_files().is_err(),
+                "dictionary mode needs a source file"
+            );
+            assert!(
+                operation
+                    .spec()
+                    .unwrap()
+                    .args
+                    .iter()
+                    .any(|arg| arg.ends_with("words.txt"))
+            );
+        }
     }
 }
