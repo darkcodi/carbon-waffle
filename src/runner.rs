@@ -152,7 +152,11 @@ impl Runner {
                         "[DEMO] Simulated job; no command executed or capture written.".into(),
                     ),
                 ));
-                if matches!(operation, Operation::Inspect { .. }) && !flag.load(Ordering::Relaxed) {
+                if matches!(
+                    operation,
+                    Operation::Inspect { .. } | Operation::InspectLive { .. }
+                ) && !flag.load(Ordering::Relaxed)
+                {
                     let _ = sender.send((id, Event::Inspection(Inspection::Found)));
                 }
                 if matches!(operation, Operation::ReadCapture { .. })
@@ -368,6 +372,22 @@ fn execute(
     if let Operation::Inspect { bssid, .. } = &request.operation {
         return inspection::run(&request.executable, &spec.args, bssid, cancel, sink);
     }
+    if let Operation::InspectLive {
+        capture,
+        bssid,
+        snapshot,
+    } = &request.operation
+    {
+        return inspection::live(
+            &request.executable,
+            &spec.args,
+            capture,
+            snapshot,
+            bssid,
+            cancel,
+            sink,
+        );
+    }
     if let Operation::Monitor {
         interface,
         enable,
@@ -396,7 +416,7 @@ fn execute(
         Some(&request.operation),
         cancel,
         sink.clone(),
-        None,
+        matches!(request.operation, Operation::Deauth { .. }).then_some(Duration::from_secs(15)),
     )?;
     sink(Event::Finished {
         code: result.code,

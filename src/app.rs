@@ -21,6 +21,7 @@ use std::{
 
 mod appearance;
 mod browser;
+mod capture;
 mod library;
 mod recovery;
 mod view;
@@ -75,8 +76,6 @@ pub enum Panel {
     Activity,
     Dependencies,
     HiddenNetworks,
-    Reconnect,
-    CaptureFile,
     Session,
     PatternHelp,
 }
@@ -86,8 +85,6 @@ struct Panels {
     activity: bool,
     dependencies: bool,
     hidden_networks: bool,
-    reconnect: bool,
-    capture_file: bool,
     session: bool,
     pattern_help: bool,
 }
@@ -147,8 +144,6 @@ pub enum Message {
     Select(String),
     ToggleNetworkGroup(String),
     Filter(String),
-    Station(String),
-    Count(String),
     RecoveryNetwork(crate::runner::CaptureNetwork),
     Wordlist(String),
     RecoveryMode(RecoveryMode),
@@ -157,7 +152,7 @@ pub enum Message {
     PatternPreview(u64, Result<pattern::Preview, String>),
     Engine(Engine),
     Run(Action),
-    StopAndCheck,
+    StopCapture,
     Stop(u64),
     StopAll,
     ClearActivity,
@@ -202,14 +197,16 @@ pub struct App {
     target: Option<Network>,
     filter: String,
     expanded_networks: HashSet<String>,
-    station: String,
-    count: String,
+    deauth_station: Option<String>,
     capture_path: String,
     capture_available: bool,
     capture_stamp: Option<(u64, SystemTime)>,
     capture_check: Option<Inspection>,
     check_after_capture: bool,
     capture_started: Option<Instant>,
+    automatic_capture: Option<capture::Automatic>,
+    capture_stop: Option<capture::StopReason>,
+    capture_problem: Option<String>,
     hash_path: String,
     recovery_capture_path: String,
     recovery_bssid: String,
@@ -284,14 +281,16 @@ impl App {
             target: None,
             filter: String::new(),
             expanded_networks: HashSet::new(),
-            station: String::new(),
-            count: "5".into(),
+            deauth_station: None,
             capture_path: String::new(),
             capture_available: false,
             capture_stamp: None,
             capture_check: None,
             check_after_capture: false,
             capture_started: None,
+            automatic_capture: None,
+            capture_stop: None,
+            capture_problem: None,
             hash_path: String::new(),
             recovery_capture_path: String::new(),
             recovery_bssid: String::new(),
@@ -429,6 +428,7 @@ impl App {
             matches!(
                 j.operation,
                 Operation::Inspect { .. }
+                    | Operation::InspectLive { .. }
                     | Operation::ReadCapture { .. }
                     | Operation::Convert { .. }
                     | Operation::Crack { .. }
@@ -562,7 +562,11 @@ impl App {
                 );
                 return;
             }
-            if let Operation::Convert { output, .. } | Operation::Crack { output, .. } = &operation
+            if let Operation::Convert { output, .. }
+            | Operation::Crack { output, .. }
+            | Operation::InspectLive {
+                snapshot: output, ..
+            } = &operation
                 && let Some(parent) = output.parent()
                 && let Err(error) = builder.create(parent)
             {
@@ -596,6 +600,12 @@ impl App {
                     self.capture_available = false;
                     self.capture_check = None;
                     self.capture_started = None;
+                    self.automatic_capture =
+                        Some(capture::Automatic::new(self.next_id, Instant::now()));
+                    self.capture_stop = None;
+                    self.capture_problem = None;
+                    self.check_after_capture = false;
+                    self.deauth_station = None;
                     if !self.demo
                         && let Some(target) = &self.target
                         && let Err(error) =
@@ -670,12 +680,17 @@ impl App {
                 interface: monitor()?,
                 prefix: path("survey"),
             }),
-            Action::Capture => Ok(Operation::Capture {
-                interface: monitor()?,
-                bssid: target()?.bssid.clone(),
-                channel: target()?.channel,
-                prefix: path("capture"),
-            }),
+            Action::Capture => {
+                if !target()?.supports_dictionary() {
+                    return Err("Choose a WPA/WPA2 Personal network for handshake capture.".into());
+                }
+                Ok(Operation::Capture {
+                    interface: monitor()?,
+                    bssid: target()?.bssid.clone(),
+                    channel: target()?.channel,
+                    prefix: path("capture"),
+                })
+            }
             Action::Deauth => {
                 let capture = self
                     .jobs
@@ -695,15 +710,8 @@ impl App {
                 Ok(Operation::Deauth {
                     interface: interface.clone(),
                     bssid: bssid.clone(),
-                    station: if self.station.trim().is_empty() {
-                        None
-                    } else {
-                        Some(self.station.trim().into())
-                    },
-                    count: self
-                        .count
-                        .parse()
-                        .map_err(|_| "Enter a burst count from 1 to 100.")?,
+                    station: self.deauth_station.clone(),
+                    count: 2,
                 })
             }
             Action::Inspect => Ok(Operation::Inspect {
@@ -791,6 +799,17 @@ impl App {
         if matches!(action, Action::Monitor | Action::Restore | Action::Scan) && self.radio_busy() {
             self.fail("Stop the active radio job first.".into());
             return;
+        }
+        if matches!(action, Action::Capture) && !self.demo {
+            for tool in [Tool::Airodump, Tool::Aireplay, Tool::Aircrack] {
+                if find_tool(tool.name()).is_none() {
+                    self.fail(format!(
+                        "{} is required for automatic capture. Install it and retry.",
+                        tool.name()
+                    ));
+                    return;
+                }
+            }
         }
         if matches!(action, Action::Capture) && self.offline_busy() {
             self.fail("Wait for the current file check or recovery job to finish.".into());
@@ -948,6 +967,30 @@ impl App {
                     self.refresh_capture_available();
                 }
                 self.library.dirty = true;
+                if self
+                    .automatic_capture
+                    .as_ref()
+                    .is_some_and(|automatic| automatic.job == id)
+                {
+                    self.capture_failed(error.clone().unwrap_or_else(|| "Recording ended before a handshake was verified. See Activity for details.".into()), true);
+                }
+            }
+            Operation::Deauth { .. } if self.automatic_capture.is_some() => {
+                self.reconnect_finished();
+                if !ok {
+                    self.capture_failed(error.clone().unwrap_or_else(|| "A disconnect request failed. Check adapter injection support and Activity, then retry.".into()), true);
+                }
+            }
+            Operation::InspectLive { .. } if self.live_inspection_matches(&job.operation) => {
+                self.live_check_finished();
+                if !ok {
+                    self.capture_failed(
+                        error.clone().unwrap_or_else(|| {
+                            "Live handshake checking failed. See Activity before retrying.".into()
+                        }),
+                        false,
+                    );
+                }
             }
             Operation::Inspect { .. } if self.inspection_matches(&job.operation) => {
                 self.refresh_capture_available();
@@ -958,7 +1001,8 @@ impl App {
                 self.status = match self.capture_check {
                     Some(Inspection::Found) if self.demo => "Demo check complete · simulated handshake.".into(),
                     Some(Inspection::Found) => "Handshake found. Choose Open in Recover to use this recording.".into(),
-                    Some(Inspection::NotFound) => "No handshake found yet. Record again while a device reconnects.".into(),
+                    Some(Inspection::NotFound) if self.capture_stop == Some(capture::StopReason::Timeout) => "Time limit reached without a handshake. You can retry the capture.".into(),
+                    Some(Inspection::NotFound) => "No handshake found. You can retry the capture.".into(),
                     _ => "Could not verify this capture. See Activity for details, then retry the check.".into(),
                 };
                 if self.status_error && !cancelled {
@@ -1077,6 +1121,11 @@ impl App {
                         }
                         Event::Line(line) => self.log(id, line),
                         Event::Inspection(result) => {
+                            if result == Inspection::Found && self.jobs.iter().any(|job|
+                                job.id == id && !job.stopping && self.live_inspection_matches(&job.operation)) {
+                                self.stop_automatic(capture::StopReason::Handshake, true);
+                                self.status = "Handshake detected. Stopping disconnect requests and saving the recording…".into();
+                            }
                             if self
                                 .jobs
                                 .iter()
@@ -1121,7 +1170,12 @@ impl App {
                                 j.id == id && matches!(j.operation, Operation::Scan { .. })
                             }) {
                                 self.survey = survey;
-                            } else {
+                            } else if self.jobs.iter().any(|job| job.id == id && matches!(job.operation, Operation::Capture { .. })) {
+                                if let Some(automatic) = &mut self.automatic_capture
+                                    && automatic.job == id
+                                    && self.target.as_ref().is_some_and(|target| survey.networks.iter().any(|network| network.bssid.eq_ignore_ascii_case(&target.bssid))) {
+                                        automatic.ready = true;
+                                }
                                 self.survey.stations = survey.stations;
                             }
                         }
@@ -1136,6 +1190,7 @@ impl App {
                 {
                     self.launch(operation);
                 }
+                self.automatic_capture_tick(Instant::now());
                 if self.check_after_capture && !self.radio_busy() && !self.offline_busy() {
                     self.check_after_capture = false;
                     self.refresh_capture_available();
@@ -1326,10 +1381,18 @@ impl App {
                 }
             }
             Message::Select(bssid) => {
-                if (!self.radio_busy()
-                    || self.jobs.iter().all(|j| {
-                        !j.operation.radio() || matches!(j.operation, Operation::Scan { .. })
-                    }))
+                if self.pending.is_none()
+                    && !self.check_after_capture
+                    && !self.jobs.iter().any(|job| {
+                        matches!(
+                            job.operation,
+                            Operation::Inspect { .. } | Operation::InspectLive { .. }
+                        )
+                    })
+                    && (!self.radio_busy()
+                        || self.jobs.iter().all(|j| {
+                            !j.operation.radio() || matches!(j.operation, Operation::Scan { .. })
+                        }))
                     && let Some(network) = self.survey.networks.iter().find(|n| n.bssid == bssid)
                 {
                     if self
@@ -1341,9 +1404,11 @@ impl App {
                         self.capture_available = false;
                         self.capture_check = None;
                         self.capture_started = None;
+                        self.capture_stop = None;
+                        self.capture_problem = None;
                     }
                     self.target = Some(network.clone());
-                    self.station.clear();
+                    self.deauth_station = None;
                 }
             }
             Message::ToggleNetworkGroup(ssid) => {
@@ -1352,8 +1417,6 @@ impl App {
                 }
             }
             Message::Filter(value) => self.filter = value,
-            Message::Station(value) => self.station = value,
-            Message::Count(value) => self.count = value,
             Message::RecoveryNetwork(network) => {
                 if !self.offline_busy() && self.recovery_networks.contains(&network) {
                     self.recovery_bssid = network.bssid;
@@ -1440,25 +1503,24 @@ impl App {
                 }
             }
             Message::Run(action) => self.run(action),
-            Message::StopAndCheck => {
-                if self.capture_running()
-                    && !self.offline_busy()
-                    && !self.closing
-                    && self.authorization == Authorization::Ready
-                {
-                    self.check_after_capture = true;
-                    for job in &mut self.jobs {
-                        if matches!(
-                            job.operation,
-                            Operation::Capture { .. } | Operation::Deauth { .. }
-                        ) {
-                            job.stop();
-                        }
-                    }
-                    self.status = "Saving the recording before checking for a handshake…".into();
-                }
+            Message::StopCapture => {
+                self.stop_automatic(capture::StopReason::Cancelled, false);
+                self.status = "Stopping capture and disconnect requests…".into();
             }
             Message::Stop(id) => {
+                if self.automatic_capture.is_some()
+                    && self.jobs.iter().any(|job| {
+                        job.id == id
+                            && matches!(
+                                job.operation,
+                                Operation::Capture { .. }
+                                    | Operation::Deauth { .. }
+                                    | Operation::InspectLive { .. }
+                            )
+                    })
+                {
+                    self.stop_automatic(capture::StopReason::Cancelled, false);
+                }
                 self.check_after_capture = false;
                 let is_capture = self
                     .jobs
@@ -1474,6 +1536,11 @@ impl App {
                 self.pending = None;
             }
             Message::StopAll => {
+                if self.automatic_capture.is_some()
+                    || matches!(self.pending, Some(Operation::Capture { .. }))
+                {
+                    self.stop_automatic(capture::StopReason::Cancelled, false);
+                }
                 self.check_after_capture = false;
                 self.pending = None;
                 for job in &mut self.jobs {
@@ -1496,14 +1563,15 @@ impl App {
                     Panel::Activity => &mut self.panels.activity,
                     Panel::Dependencies => &mut self.panels.dependencies,
                     Panel::HiddenNetworks => &mut self.panels.hidden_networks,
-                    Panel::Reconnect => &mut self.panels.reconnect,
-                    Panel::CaptureFile => &mut self.panels.capture_file,
                     Panel::Session => &mut self.panels.session,
                     Panel::PatternHelp => &mut self.panels.pattern_help,
                 };
                 *open = !*open;
             }
             Message::Close => {
+                if self.automatic_capture.is_some() {
+                    self.stop_automatic(capture::StopReason::Cancelled, false);
+                }
                 self.save_recovery();
                 self.invalidate_preview();
                 self.check_after_capture = false;
@@ -1696,6 +1764,9 @@ mod tests {
         assert_eq!(app.jobs.len(), 1);
         app.run(Action::Capture);
         assert!(app.pending.is_some());
+        let bssid = app.target.as_ref().unwrap().bssid.clone();
+        let _ = app.update(Message::Select(app.survey.networks[1].bssid.clone()));
+        assert_eq!(app.target.as_ref().unwrap().bssid, bssid);
         assert!(app.jobs[0].stopping);
         pump_until(&mut app, App::capture_running);
         assert_eq!(app.jobs.len(), 1);
@@ -1721,6 +1792,137 @@ mod tests {
         app.run(Action::Deauth);
         assert!(app.jobs.is_empty());
         assert!(app.status.contains("Start a target capture"));
+    }
+
+    #[test]
+    fn automatic_capture_stops_on_a_live_handshake_then_verifies_the_saved_file() {
+        let mut app = demo_app();
+        app.page = Page::Capture;
+        app.run(Action::Capture);
+        pump_until(&mut app, App::capture_running);
+        app.automatic_capture.as_mut().unwrap().next_check = Instant::now();
+        app.automatic_capture_tick(Instant::now());
+        assert!(
+            app.jobs
+                .iter()
+                .any(|job| matches!(job.operation, Operation::InspectLive { .. }))
+        );
+        app.run(Action::Deauth);
+        assert!(
+            app.jobs
+                .iter()
+                .any(|job| matches!(job.operation, Operation::Deauth { .. }))
+        );
+        pump_until(&mut app, |app| {
+            app.capture_stop == Some(capture::StopReason::Handshake)
+        });
+        assert!(app.automatic_capture.is_none());
+        assert!(
+            app.jobs
+                .iter()
+                .filter(|job| matches!(
+                    job.operation,
+                    Operation::Capture { .. }
+                        | Operation::Deauth { .. }
+                        | Operation::InspectLive { .. }
+                ))
+                .all(|job| job.stopping)
+        );
+        assert!(
+            !app.can_use_capture(),
+            "live evidence alone must not enable recovery"
+        );
+        pump_until(&mut app, |app| app.jobs.is_empty());
+        assert_eq!(app.capture_check, Some(Inspection::Found));
+        assert!(app.can_use_capture());
+        assert!(
+            app.activity
+                .iter()
+                .any(|activity| activity.label == "Inspect capture")
+        );
+        let count = app.activity.len();
+        app.automatic_capture_tick(Instant::now() + Duration::from_secs(60));
+        assert_eq!(app.activity.len(), count);
+    }
+
+    #[test]
+    fn automatic_capture_timeout_and_stop_cancel_requests_without_restarting_them() {
+        for stop in [false, true] {
+            let mut app = demo_app();
+            app.run(Action::Capture);
+            pump_until(&mut app, App::capture_running);
+            app.run(Action::Deauth);
+            if stop {
+                let _ = app.update(Message::StopCapture);
+                assert!(!app.check_after_capture);
+                assert_eq!(app.capture_stop, Some(capture::StopReason::Cancelled));
+            } else {
+                let started = app.automatic_capture.as_ref().unwrap().started;
+                app.automatic_capture_tick(started + capture::LIMIT);
+                assert!(app.check_after_capture);
+                assert_eq!(app.capture_stop, Some(capture::StopReason::Timeout));
+            }
+            assert!(app.automatic_capture.is_none());
+            assert!(app.jobs.iter().all(|job| job.stopping));
+            let count = app.activity.len();
+            app.automatic_capture_tick(Instant::now() + Duration::from_secs(300));
+            assert_eq!(app.activity.len(), count);
+            let _ = app.update(Message::StopAll);
+            pump_until(&mut app, |app| app.jobs.is_empty());
+            assert_eq!(app.activity.len(), count);
+            assert_eq!(app.capture_check, None);
+        }
+    }
+
+    #[test]
+    fn a_failed_live_checker_stops_capture_and_disconnect_requests() {
+        let mut app = demo_app();
+        app.run(Action::Capture);
+        pump_until(&mut app, App::capture_running);
+        app.automatic_capture.as_mut().unwrap().next_check = Instant::now();
+        app.automatic_capture_tick(Instant::now());
+        let check = app
+            .jobs
+            .iter()
+            .find(|job| matches!(job.operation, Operation::InspectLive { .. }))
+            .unwrap()
+            .id;
+        app.run(Action::Deauth);
+        app.finished(
+            check,
+            None,
+            false,
+            Some("Cannot read capture snapshot".into()),
+        );
+        assert!(app.automatic_capture.is_none());
+        assert!(app.jobs.iter().all(|job| job.stopping));
+        assert_eq!(
+            app.capture_problem.as_deref(),
+            Some("Cannot read capture snapshot")
+        );
+        assert!(!app.check_after_capture);
+        pump_until(&mut app, |app| app.jobs.is_empty());
+        assert!(!app.can_use_capture());
+    }
+
+    #[test]
+    fn an_unrelated_live_check_cannot_complete_the_current_capture() {
+        let mut app = demo_app();
+        app.run(Action::Capture);
+        pump_until(&mut app, App::capture_running);
+        app.automatic_capture.as_mut().unwrap().next_check =
+            Instant::now() + Duration::from_secs(60);
+        app.launch(Operation::InspectLive {
+            capture: PathBuf::from(&app.capture_path),
+            bssid: "02:00:00:00:FF:FF".into(),
+            snapshot: app.session.join("recovery/other.cap"),
+        });
+        pump_until(&mut app, |app| !app.offline_busy());
+        assert!(app.automatic_capture.is_some());
+        assert!(app.capture_running());
+        assert_eq!(app.capture_check, None);
+        let _ = app.update(Message::StopCapture);
+        pump_until(&mut app, |app| app.jobs.is_empty());
     }
 
     #[test]
@@ -2031,7 +2233,7 @@ mod tests {
         assert!(!app.capture_path.is_empty());
         let _ = app.update(Message::Next);
         assert_eq!(app.page, Page::Capture);
-        let _ = app.update(Message::StopAndCheck);
+        app.stop_automatic(capture::StopReason::Handshake, true);
         assert!(!app.can_advance());
         pump_until(&mut app, |app| app.jobs.is_empty());
         assert!(app.can_use_capture());
@@ -2066,10 +2268,10 @@ mod tests {
         assert_eq!(
             app.jobs.len(),
             1,
-            "recording never sends disconnect requests automatically"
+            "reconnect requests wait until recording is ready"
         );
         app.run(Action::Deauth);
-        let _ = app.update(Message::StopAndCheck);
+        app.stop_automatic(capture::StopReason::Handshake, true);
         assert!(app.check_after_capture);
         assert!(app.jobs.iter().all(|job| job.stopping));
         pump_until(&mut app, |app| {

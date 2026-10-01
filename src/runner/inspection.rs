@@ -164,13 +164,10 @@ pub(super) fn run(
         Arc::new(move |event| {
             if let Event::Line(line) = &event
                 && let Some(value) = summary(line, &bssid)
+                && !stop.swap(true, Ordering::Relaxed)
             {
-                let mut result = found.lock().unwrap();
-                if result.is_none() {
-                    *result = Some(value);
-                }
                 // The summary is sufficient; do not wait at a selection prompt.
-                stop.store(true, Ordering::Relaxed);
+                *found.lock().unwrap() = Some(value);
             }
             output_sink(event);
         }),
@@ -195,10 +192,133 @@ pub(super) fn run(
     Ok(())
 }
 
+/// Check a bounded copy of the growing file, never race Aircrack against its
+/// writer or leave temporary captures behind. The original is checked again
+/// after airodump has flushed and exited before the UI reports success.
+pub(super) fn live(
+    executable: &Path,
+    args: &[String],
+    capture: &Path,
+    snapshot: &Path,
+    bssid: &str,
+    cancel: Arc<AtomicBool>,
+    sink: Arc<impl Fn(Event) + Send + Sync + 'static>,
+) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut source = fs::File::options()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(capture)
+        .map_err(|e| format!("Cannot read the recording: {e}"))?;
+    let metadata = source.metadata().map_err(|e| e.to_string())?;
+    if !metadata.is_file() {
+        return Err("The recording is not a regular file.".into());
+    }
+    let mut remaining = metadata.len();
+    sink(Event::Line(format!(
+        "Checking a snapshot of {} ({remaining} bytes).",
+        capture.display()
+    )));
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(snapshot)
+        .map_err(|e| format!("Cannot create a capture snapshot: {e}"))?;
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(snapshot.into());
+    let mut buffer = [0u8; 65536];
+    while remaining > 0 && !cancel.load(Ordering::Relaxed) {
+        let length = remaining.min(buffer.len() as u64) as usize;
+        let read = source
+            .read(&mut buffer[..length])
+            .map_err(|e| e.to_string())?;
+        if read == 0 {
+            return Err("The recording changed while it was being checked.".into());
+        }
+        output
+            .write_all(&buffer[..read])
+            .map_err(|e| e.to_string())?;
+        remaining -= read as u64;
+    }
+    drop(output);
+    if cancel.load(Ordering::Relaxed) {
+        sink(Event::Finished {
+            code: None,
+            cancelled: true,
+        });
+        return Ok(());
+    }
+    run(executable, args, bssid, cancel, sink)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn live_checks_use_a_private_snapshot_and_always_remove_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = dir.path().join("recording.cap");
+        let snapshot = dir.path().join("snapshot.cap");
+        let executable = dir.path().join("aircrack-ng");
+        fs::write(&capture, b"synthetic recording").unwrap();
+        fs::write(&executable, "#!/bin/sh\n[ -f \"$1\" ] || exit 2\n[ \"$(cat \"$1\")\" = 'synthetic recording' ] || exit 3\nprintf '   1  02:11:22:33:44:55  Lab                     WPA (1 handshake)\\n'\nsleep 30\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let (sender, received) = mpsc::channel();
+        live(
+            &executable,
+            &[snapshot.to_string_lossy().into_owned()],
+            &capture,
+            &snapshot,
+            "02:11:22:33:44:55",
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(move |event| {
+                sender.send(event).unwrap();
+            }),
+        )
+        .unwrap();
+        assert!(
+            received
+                .try_iter()
+                .any(|event| matches!(event, Event::Inspection(Inspection::Found)))
+        );
+        assert!(!snapshot.exists());
+        assert_eq!(fs::read(&capture).unwrap(), b"synthetic recording");
+        // Cancellation must not run the checker or leave a partial snapshot.
+        live(
+            &dir.path().join("missing-tool"),
+            &[],
+            &capture,
+            &snapshot,
+            "02:11:22:33:44:55",
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+        assert!(!snapshot.exists());
+        // Existing files must never be overwritten or deleted by cleanup.
+        fs::write(&snapshot, b"keep me").unwrap();
+        assert!(
+            live(
+                &executable,
+                &[],
+                &capture,
+                &snapshot,
+                "02:11:22:33:44:55",
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(|_| {})
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&snapshot).unwrap(), b"keep me");
+    }
 
     #[test]
     fn lists_all_wpa_networks_and_stops_at_a_prompt_without_a_newline() {
@@ -292,6 +412,43 @@ mod tests {
                 .try_iter()
                 .any(|event| matches!(event, Event::Inspection(Inspection::Unknown)))
         );
+    }
+
+    #[test]
+    fn cancellation_ignores_a_handshake_summary_emitted_during_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("aircrack-ng");
+        fs::write(&executable, "#!/bin/sh\ntrap \"printf '   1  02:11:22:33:44:55  Lab                     WPA (1 handshake)\\\\n'; exit 0\" INT\nprintf 'ready\\n'\nsleep 30\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let (sender, received) = mpsc::channel();
+        run(
+            &executable,
+            &[],
+            "02:11:22:33:44:55",
+            cancel,
+            Arc::new(move |event| {
+                if matches!(&event, Event::Line(line) if line == "ready") {
+                    flag.store(true, Ordering::Relaxed);
+                }
+                sender.send(event).unwrap();
+            }),
+        )
+        .unwrap();
+        let events: Vec<_> = received.try_iter().collect();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Inspection(Inspection::Found)))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Finished {
+                cancelled: true,
+                ..
+            }
+        )));
     }
 
     #[test]

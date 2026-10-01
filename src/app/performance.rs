@@ -129,30 +129,41 @@ fn capture_previews() {
         ("found", Some(Inspection::Found)),
         ("missing", Some(Inspection::NotFound)),
         ("error", Some(Inspection::Unknown)),
-        ("options", None),
+        ("timeout", Some(Inspection::NotFound)),
+        ("cancelled", None),
     ] {
         let mut app = App::new(true);
         app.page = Page::Capture;
         app.interface.as_mut().unwrap().monitor = true;
         app.load_demo();
         app.target.as_mut().unwrap().ssid = "Research Wi-Fi".into();
-        app.status = "Select Start recording to begin.".into();
+        app.status = "Select Capture to begin.".into();
         if name != "ready" {
             app.capture_path = "/home/researcher/captures/session/capture-4-01.cap".into();
             app.capture_available = true;
         }
-        if name == "recording" || name == "options" {
+        if name == "recording" {
             let operation = app.operation(Action::Capture).unwrap();
             let mut job = app.runner.start(1, operation, true).unwrap();
             job.started = true;
             app.jobs.push(job);
             app.capture_started = Some(Instant::now() - Duration::from_secs(65));
             app.status = "Recording traffic from the selected network.".into();
-            app.panels.reconnect = name == "options";
+            let mut automatic =
+                capture::Automatic::new(1, Instant::now() - Duration::from_secs(65));
+            automatic.ready = true;
+            automatic.requests = 3;
+            app.automatic_capture = Some(automatic);
         } else if name == "checking" {
             let operation = app.operation(Action::Inspect).unwrap();
             app.jobs.push(app.runner.start(1, operation, true).unwrap());
             app.status = "Checking the saved recording.".into();
+        }
+        if name == "timeout" {
+            app.capture_stop = Some(capture::StopReason::Timeout);
+        }
+        if name == "cancelled" {
+            app.capture_stop = Some(capture::StopReason::Cancelled);
         }
         app.capture_check = state;
         // Render real-mode copy using only synthetic data and demo jobs.

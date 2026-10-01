@@ -83,6 +83,11 @@ pub enum Operation {
         capture: PathBuf,
         bssid: String,
     },
+    InspectLive {
+        capture: PathBuf,
+        bssid: String,
+        snapshot: PathBuf,
+    },
     ReadCapture {
         capture: PathBuf,
     },
@@ -136,6 +141,7 @@ impl Operation {
             Self::Capture { .. } => "Capture handshake",
             Self::Deauth { .. } => "Deauthenticate",
             Self::Inspect { .. } => "Inspect capture",
+            Self::InspectLive { .. } => "Check for handshake",
             Self::ReadCapture { .. } => "Read saved capture",
             Self::Convert { .. } => "Convert to hc22000",
             Self::Crack {
@@ -281,6 +287,18 @@ impl Operation {
                 // The worker selects the matching summary row and stops here.
                 (Tool::Aircrack, vec![path(capture)?], false)
             }
+            Self::InspectLive {
+                capture,
+                bssid,
+                snapshot,
+            } => {
+                path(capture)?;
+                mac(bssid)?;
+                if capture == snapshot {
+                    return Err("A live check must use a separate snapshot.".into());
+                }
+                (Tool::Aircrack, vec![path(snapshot)?], false)
+            }
             Self::Convert { capture, output } => (
                 Tool::Hcx,
                 vec!["-o".into(), path(output)?, path(capture)?],
@@ -370,6 +388,7 @@ impl Operation {
         };
         match self {
             Self::Inspect { capture, .. }
+            | Self::InspectLive { capture, .. }
             | Self::ReadCapture { capture }
             | Self::Convert { capture, .. } => require(capture)?,
             Self::Crack {
@@ -389,7 +408,11 @@ impl Operation {
             }
             _ => {}
         }
-        if let Self::Convert { output, .. } | Self::Crack { output, .. } = self
+        if let Self::Convert { output, .. }
+        | Self::Crack { output, .. }
+        | Self::InspectLive {
+            snapshot: output, ..
+        } = self
             && output.exists()
         {
             return Err("Output already exists; use a new output file.".into());

@@ -774,6 +774,7 @@ impl App {
     }
 
     fn capture(&self) -> Element<'_, Message> {
+        use super::capture::StopReason;
         let capture = self
             .jobs
             .iter()
@@ -784,7 +785,11 @@ impl App {
             .find(|job| matches!(job.operation, Operation::Inspect { .. }));
         let switching = matches!(self.pending, Some(Operation::Capture { .. }));
         let idle = !self.radio_busy() && !self.offline_busy() && self.pending.is_none();
-        let can_record = self.target.is_some()
+        let supported = self
+            .target
+            .as_ref()
+            .is_some_and(Network::supports_dictionary);
+        let can_record = supported
             && self
                 .interface
                 .as_ref()
@@ -802,44 +807,49 @@ impl App {
             self.survey
                 .stations
                 .iter()
-                .filter(|station| station.bssid == target.bssid)
+                .filter(|client| client.bssid.eq_ignore_ascii_case(&target.bssid))
                 .count()
         });
-
         let (title, explanation, busy) = if switching {
             (
-                "Preparing to record".to_string(),
-                "Finishing discovery and switching to your selected network’s channel.",
+                "Preparing capture".into(),
+                "Stopping discovery and switching to the selected network’s channel.",
                 true,
             )
         } else if let Some(job) = capture {
             if job.stopping {
                 (
-                    "Saving your recording".into(),
-                    if self.check_after_capture {
-                        "The handshake check will start as soon as recording stops."
+                    if self.capture_stop == Some(StopReason::Handshake) {
+                        "Handshake detected"
                     } else {
-                        "Wait for the recording to finish saving before checking it."
-                    },
+                        "Saving your capture"
+                    }
+                    .into(),
+                    "Stopping disconnect requests and saving the recording.",
                     true,
                 )
-            } else if !job.started {
+            } else if !job.started
+                || self
+                    .automatic_capture
+                    .as_ref()
+                    .is_some_and(|automatic| !automatic.ready)
+            {
                 (
-                    "Starting recording".into(),
-                    "Keep a phone or laptop nearby. You’ll reconnect it once recording starts.",
+                    "Listening for the network".into(),
+                    "Capture starts before any disconnect requests are sent.",
                     true,
                 )
             } else {
                 (
-                    format!("Recording · {:02}:{:02}", elapsed / 60, elapsed % 60),
-                    "On a phone or laptop, turn Wi-Fi off and on, then reconnect to this network. Once it reconnects, stop and check the recording.",
+                    format!("Capturing · {:02}:{:02}", elapsed / 60, elapsed % 60),
+                    "Reconnecting clients and checking for a handshake automatically. Newly connected clients are included.",
                     true,
                 )
             }
-        } else if checking.is_some() {
+        } else if checking.is_some() || self.check_after_capture {
             (
-                "Checking for a handshake".into(),
-                "Checking the saved recording for your selected network. This usually takes a moment.",
+                "Verifying the saved handshake".into(),
+                "Recording has stopped. Checking the saved file before marking it ready for recovery.",
                 true,
             )
         } else if found {
@@ -847,90 +857,69 @@ impl App {
                 if self.demo {
                     "Demo handshake found"
                 } else {
-                    "Handshake found"
+                    "Handshake captured"
                 }
                 .into(),
                 if self.demo {
-                    "This is a simulated result. Open it in Recover to preview password recovery."
+                    "This is a simulated result. No packets were sent or recorded."
                 } else {
-                    "Your recording contains a handshake for this network. Open it in Recover now, or use the saved file later."
+                    "Capture and disconnect requests have stopped. Your recording is saved and ready for recovery."
                 },
                 false,
             )
-        } else if self.capture_check == Some(super::Inspection::NotFound) {
+        } else if self.capture_problem.is_some() {
             (
-                "No handshake found yet".into(),
-                "Try another recording. Start first, reconnect a device to this Wi-Fi, then stop and check again.",
+                "Capture couldn’t finish".into(),
+                self.capture_problem.as_deref().unwrap(),
+                false,
+            )
+        } else if self.capture_stop == Some(StopReason::Timeout) {
+            (
+                "No handshake after 2 minutes".into(),
+                "The attempt stopped automatically. A client may not have reconnected; you can try again.",
+                false,
+            )
+        } else if self.capture_stop == Some(StopReason::Cancelled) {
+            (
+                "Capture stopped".into(),
+                "Any recorded traffic is saved. Start another attempt, or check the saved recording.",
                 false,
             )
         } else if self.capture_check == Some(super::Inspection::Unknown) {
             (
-                "Couldn’t verify this recording".into(),
-                "See Activity for the check details, then retry. You can also start a new recording.",
+                "Couldn’t verify the recording".into(),
+                "See Activity for details. You can retry the check or make a new capture.",
                 false,
             )
-        } else if self.capture_available {
+        } else if self.capture_check == Some(super::Inspection::NotFound) {
             (
-                "Recording ready to check".into(),
-                "Check this recording for a handshake before moving to password recovery.",
-                false,
-            )
-        } else if !self.capture_path.is_empty() {
-            (
-                "Capture file unavailable".into(),
-                "The file is missing or empty. Start a new recording, or choose a saved capture in Recover.",
+                "No handshake found".into(),
+                "The saved recording has no verified handshake. Try another capture when a client is connected.",
                 false,
             )
         } else {
             (
-                "Ready to record".into(),
-                "Start recording, then reconnect a phone or laptop to this Wi-Fi. Your recording is saved automatically; stop and check once the device reconnects.",
+                "Capture a handshake".into(),
+                "Briefly disconnects clients, records their reconnection, and stops when a handshake is verified.",
                 false,
             )
         };
-
-        let target: Element<'_, Message> = if let Some(target) = &self.target {
+        let network: Element<'_, Message> = if let Some(target) = &self.target {
             column![
                 text(target.label()).font(style::SEMIBOLD).size(16),
-                text(format!(
-                    "{}  ·  Channel {}{}",
-                    target.bssid,
-                    target.channel,
-                    if self.capture_running() {
-                        format!(
-                            "  ·  {clients} {} seen",
-                            if clients == 1 { "device" } else { "devices" }
-                        )
-                    } else {
-                        String::new()
-                    }
-                ))
-                .font(Font::MONOSPACE)
-                .size(11)
-                .color(style::MUTED),
+                text(format!("{} · Channel {}", target.bssid, target.channel))
+                    .size(12)
+                    .color(style::MUTED),
             ]
-            .spacing(5)
+            .spacing(6)
             .width(Fill)
             .into()
         } else {
-            text("Select a network in Discover first.")
+            text("Choose a network in Discover.")
                 .size(14)
                 .width(Fill)
                 .into()
         };
-        let network = row![
-            target,
-            button(text("Change").size(12))
-                .on_press_maybe(
-                    (capture.is_none() && checking.is_none() && !switching)
-                        .then_some(Message::Page(Page::Discover))
-                )
-                .padding([8, 4])
-                .style(style::quiet),
-        ]
-        .spacing(12)
-        .align_y(Center)
-        .width(Fill);
         let indicator: Element<'_, Message> = if busy {
             self.spinner()
         } else {
@@ -957,45 +946,39 @@ impl App {
                 .align_x(Center)
                 .width(Fill),
         ]
-        .spacing(10)
+        .spacing(12)
         .align_x(Center)
         .width(Fill);
-
-        if let Some(job) = capture {
-            if job.started && !job.stopping {
+        if capture.is_some_and(|job| !job.stopping) || switching {
+            if let Some(automatic) = &self.automatic_capture {
                 body = body.push(
-                    button(
-                        text("Stop & check")
-                            .size(15)
-                            .font(style::SEMIBOLD)
-                            .align_x(Center)
-                            .width(Fill),
-                    )
-                    .on_press_maybe(
-                        (!self.closing && self.authorization == Authorization::Ready)
-                            .then_some(Message::StopAndCheck),
-                    )
-                    .padding([15, 20])
-                    .width(Fill)
-                    .style(style::primary),
+                    text(format!(
+                        "{clients} {} seen · {} reconnect requests · {}s remaining",
+                        if clients == 1 { "device" } else { "devices" },
+                        automatic.requests,
+                        super::capture::LIMIT
+                            .as_secs()
+                            .saturating_sub(automatic.started.elapsed().as_secs())
+                    ))
+                    .size(12)
+                    .color(style::MUTED),
                 );
             }
+            body = body.push(
+                button(text("Stop capture").size(14).align_x(Center).width(Fill))
+                    .on_press_maybe((!self.closing).then_some(Message::StopCapture))
+                    .padding([15, 20])
+                    .width(Fill)
+                    .style(style::secondary),
+            );
         } else if let Some(job) = checking {
             body = body.push(
                 button(text("Cancel check").size(12))
                     .on_press_maybe((!job.stopping).then_some(Message::Stop(job.id)))
                     .style(style::quiet),
             );
-        } else if !switching {
-            if self.target.is_none() {
-                body = body.push(
-                    button(text("Choose a network").align_x(Center).width(Fill))
-                        .on_press(Message::Page(Page::Discover))
-                        .width(Fill)
-                        .padding(15)
-                        .style(style::primary),
-                );
-            } else if found {
+        } else if !busy {
+            if found {
                 body = body.push(
                     button(
                         text("Open in Recover →")
@@ -1009,38 +992,40 @@ impl App {
                     .width(Fill)
                     .style(style::primary),
                 );
-            } else if self.capture_check == Some(super::Inspection::NotFound)
-                || !self.capture_available
-            {
+                body = body.push(
+                    self.action("Capture again", Action::Capture, can_record)
+                        .style(style::quiet),
+                );
+            } else {
                 body = body.push(
                     self.action(
                         if self.capture_path.is_empty() {
-                            "Start recording"
+                            "Capture"
                         } else {
-                            "Record again"
+                            "Capture again"
                         },
                         Action::Capture,
                         can_record,
                     )
                     .width(Fill),
                 );
-            } else {
-                body = body.push(
-                    self.action(
-                        if self.capture_check == Some(super::Inspection::Unknown) {
-                            "Retry check"
-                        } else {
-                            "Check handshake"
-                        },
-                        Action::Inspect,
-                        idle && self.capture_available,
-                    )
-                    .width(Fill),
-                );
+                if self.capture_available {
+                    body = body.push(
+                        self.action("Check saved recording", Action::Inspect, idle)
+                            .style(style::quiet)
+                            .width(Fill),
+                    );
+                }
             }
-            if !can_record && !self.capture_available && self.target.is_some() {
+            if !supported {
                 body = body.push(
-                    text("Return to Monitoring and enable monitor mode to record.")
+                    text("Choose a WPA/WPA2 Personal network in Discover.")
+                        .size(12)
+                        .color(style::MUTED),
+                );
+            } else if !can_record && !self.capture_available {
+                body = body.push(
+                    text("Enable monitor mode in Monitoring to capture.")
                         .size(12)
                         .color(style::MUTED),
                 );
@@ -1048,13 +1033,21 @@ impl App {
         }
         let card = container(
             column![
-                network,
+                row![
+                    network,
+                    button(text("Change").size(12))
+                        .on_press_maybe(idle.then_some(Message::Page(Page::Discover)))
+                        .padding([8, 4])
+                        .style(style::quiet)
+                ]
+                .spacing(12)
+                .align_y(Center),
                 widget::rule::horizontal(1).style(style::divider),
-                body
+                body,
             ]
-            .spacing(12),
+            .spacing(14),
         )
-        .padding(16)
+        .padding(18)
         .width(Fill)
         .style(move |theme| {
             let mut card = style::card(theme);
@@ -1063,95 +1056,20 @@ impl App {
             }
             card
         });
-        let mut content = column![card].spacing(10).width(Fill);
-
-        if self.capture_running() {
-            content = content.push(self.reconnect_options());
-        }
-        content = content.push(
-            text("Recordings are saved automatically and appear in Recover.")
-                .size(12)
-                .color(style::MUTED),
-        );
-        if !self.capture_path.is_empty() {
-            content = content.push(disclosure(
-                "Recording options",
-                self.panels.capture_file,
-                Panel::CaptureFile,
-            ));
-            if self.panels.capture_file {
-                content = content.push(
-                    row![
-                        self.action(
-                            "Check again",
-                            Action::Inspect,
-                            idle && self.capture_available
-                        )
-                        .style(style::secondary)
-                        .width(Fill),
-                        self.action("New recording", Action::Capture, can_record)
-                            .style(style::secondary)
-                            .width(Fill),
-                    ]
-                    .spacing(12),
-                );
-            }
-        }
-        container(content).max_width(640).width(Fill).into()
-    }
-
-    fn reconnect_options(&self) -> Element<'_, Message> {
-        let deauth = self
-            .jobs
-            .iter()
-            .any(|job| matches!(job.operation, Operation::Deauth { .. }));
-        let mut content = column![disclosure(
-            "Need help reconnecting a device?",
-            self.panels.reconnect,
-            Panel::Reconnect
-        )]
-        .spacing(12);
-        if self.panels.reconnect {
-            let mut options = column![
-                text("You can reconnect a device manually. Or send a brief disconnect request below so it can reconnect while recording continues.").size(13).line_height(1.5).color(style::MUTED),
-                row![
-                    field("Device MAC · empty means all devices", "AA:BB:CC:DD:EE:FF", &self.station, Message::Station),
-                    container(field("Bursts", "5", &self.count, Message::Count)).width(90),
-                ].spacing(12),
-            ].spacing(14);
-            if let Some(target) = &self.target {
-                let mut clients = row![
-                    button(text("All devices").size(11))
-                        .on_press(Message::Station(String::new()))
-                        .style(style::secondary)
-                        .padding([6, 8])
-                ]
-                .spacing(6);
-                for station in self
-                    .survey
-                    .stations
-                    .iter()
-                    .filter(|station| station.bssid == target.bssid)
-                {
-                    clients = clients.push(
-                        button(text(&station.mac).font(Font::MONOSPACE).size(11))
-                            .on_press(Message::Station(station.mac.clone()))
-                            .style(style::secondary)
-                            .padding([6, 8]),
-                    );
-                }
-                options = options.push(clients.wrap());
-            }
-            options = options.push(self.action(if deauth { "Sending request…" } else { "Send disconnect request" }, Action::Deauth, self.capture_running() && !deauth).style(style::secondary).width(Fill))
-                .push(text("This briefly interrupts Wi-Fi for the selected device, or all devices if left empty. Reconnection is not guaranteed.").size(12).color(style::MUTED));
-            content = content.push(
-                container(options)
-                    .padding(20)
-                    .width(Fill)
-                    .style(style::card),
-            );
-        }
-        content.width(Fill).into()
+        container(
+            column![
+                card,
+                text("Stops after one handshake or 2 minutes. Recordings are saved in Recover.")
+                    .size(12)
+                    .color(style::MUTED)
+                    .align_x(Center)
+                    .width(Fill),
+            ]
+            .spacing(14),
+        )
+        .max_width(640)
+        .width(Fill)
+        .into()
     }
 
     fn capture_library(&self) -> Element<'_, Message> {
@@ -1261,6 +1179,7 @@ impl App {
                 Operation::Crack { .. }
                     | Operation::Convert { .. }
                     | Operation::Inspect { .. }
+                    | Operation::InspectLive { .. }
                     | Operation::ReadCapture { .. }
             )
         });
@@ -1893,25 +1812,6 @@ fn heading(title: &'static str, subtitle: &'static str) -> Element<'static, Mess
             .width(Fill),
     ]
     .spacing(10)
-    .width(Fill)
-    .into()
-}
-
-fn field<'a>(
-    label: &'static str,
-    placeholder: &'static str,
-    value: &'a str,
-    on_input: fn(String) -> Message,
-) -> Element<'a, Message> {
-    column![
-        text(label).size(12).color(style::MUTED),
-        text_input(placeholder, value)
-            .on_input(on_input)
-            .padding(13)
-            .size(14)
-            .style(style::input),
-    ]
-    .spacing(8)
     .width(Fill)
     .into()
 }
